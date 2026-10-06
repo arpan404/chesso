@@ -191,7 +191,8 @@ class Grade:
     def __init__(self, label: str, points: int, cp_loss: int,
                  best_uci: str, best_san: str, best_eval: str,
                  played_eval: str, played_san: str, win_before: float,
-                 win_after: float, source: str, mover_is_white: bool):
+                 win_after: float, source: str, mover_is_white: bool,
+                 best_cp: int = 0, played_cp: int = 0):
         self.label = label
         self.points = points
         self.cp_loss = cp_loss
@@ -204,6 +205,8 @@ class Grade:
         self.win_after = win_after
         self.source = source
         self.mover_is_white = mover_is_white
+        self.best_cp = best_cp      # numeric, mover's perspective
+        self.played_cp = played_cp  # numeric, mover's perspective
 
     def __repr__(self) -> str:  # handy for logs/tests
         return (f"Grade({self.label} {self.points:+d} loss={self.cp_loss} "
@@ -291,20 +294,50 @@ class EngineManager:
             except Exception:
                 moves = list(board.legal_moves)
                 return moves[0] if moves else None
+        return self._engine_move(board, int(cfg["skill"]),
+                                float(cfg["time"]), int(cfg["depth"]))
+
+    # -- rated ladder (adaptive opponents, 300–1200) -------------------------
+    RATED_AI: dict[int, dict] = {
+        300: {"name": "Rookie", "local": True, "skill": 0, "time": 0.1, "depth": 4},
+        600: {"name": "Casual", "local": False, "skill": 2, "time": 0.2, "depth": 8},
+        900: {"name": "Club", "local": False, "skill": 8, "time": 0.35, "depth": 12},
+        1200: {"name": "Strong", "local": False, "skill": 14, "time": 0.6, "depth": 16},
+    }
+
+    @classmethod
+    def rung_for(cls, elo: int) -> tuple[int, dict]:
+        """Nearest ladder rung (ties go weaker). Returns (rating, cfg)."""
+        best = min(cls.RATED_AI, key=lambda r: (abs(r - elo), r))
+        return best, cls.RATED_AI[best]
+
+    def choose_move_rated(self, board: chess.Board, elo: int):
+        """Adaptive-AI move for a ladder rating. Never raises."""
+        _, cfg = self.rung_for(elo)
+        if cfg["local"] or self._ensure() is None:
+            try:
+                mv, _ = _local_search(board.copy(), depth=1)
+                return mv
+            except Exception:
+                moves = list(board.legal_moves)
+                return moves[0] if moves else None
+        return self._engine_move(board, int(cfg["skill"]),
+                                float(cfg["time"]), int(cfg["depth"]))
+
+    def _engine_move(self, board: chess.Board, skill: int, time_s: float, depth: int):
         try:
             with self._lock:
                 eng = self._ensure()
                 if eng is None:
                     raise RuntimeError("no engine")
                 try:
-                    eng.configure({"Skill Level": int(cfg["skill"])})
+                    eng.configure({"Skill Level": skill})
                 except Exception:
                     pass
                 try:
                     res = eng.play(
                         board.copy(),
-                        chess.engine.Limit(time=float(cfg["time"]),
-                                           depth=int(cfg["depth"])),
+                        chess.engine.Limit(time=time_s, depth=depth),
                     )
                     mv = res.move
                 finally:
@@ -426,6 +459,7 @@ class EngineManager:
             played_eval=cp_to_text(played_cp), played_san=played_san,
             win_before=win_pct(best_cp), win_after=win_pct(played_cp),
             source=src, mover_is_white=mover_white,
+            best_cp=int(best_cp), played_cp=int(played_cp),
         )
 
 

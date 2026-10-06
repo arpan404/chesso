@@ -1,4 +1,5 @@
 # Python-generated files
+.DS_Store
 __pycache__/
 *.py[oc]
 build/
@@ -9,5 +10,10 @@ wheels/
 # Virtual environments
 .venv
 
-# Local user state (puzzle rating)
+# Local user state (ratings) and research data — never commit
 rating.json
+profile.json
+data/
+
+# Individual coursework documents
+docs/reading-logs/

@@ -7,15 +7,18 @@ Run with:
 from __future__ import annotations
 
 import array
+import argparse
 import math
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 
 import chess
 import pygame
 
 import coach
+import profile as profile_mod
 
 # --------------------------------------------------------------------------
 # Config / theme
@@ -27,20 +30,21 @@ BOARD_X, BOARD_Y = 32, 40
 PANEL_X = BOARD_X + BOARD_PX + 24
 PANEL_W = WIN_W - PANEL_X - 24
 
-BG = (18, 19, 28)
+BG = (21, 22, 33)
 BG2 = (26, 27, 40)
-PANEL_BG = (30, 31, 46)
-LIGHT_SQ = (240, 217, 181)
-DARK_SQ = (181, 136, 99)
-LIGHT_SQ_HOVER = (245, 228, 195)
-DARK_SQ_HOVER = (193, 148, 110)
+PANEL_BG = (32, 33, 50)
+LIGHT_SQ = (237, 214, 179)
+DARK_SQ = (175, 130, 95)
+LIGHT_SQ_HOVER = (243, 224, 192)
+DARK_SQ_HOVER = (186, 142, 106)
 BORDER = (16, 16, 24)
-TEXT = (235, 235, 245)
-MUTED = (150, 152, 175)
+TEXT = (236, 236, 245)
+MUTED = (155, 157, 180)
 ACCENT = (129, 182, 255)
 GREEN = (110, 200, 130)
 YELLOW = (240, 200, 90)
 RED = (235, 90, 90)
+LAST_MOVE_HL = (205, 210, 60)
 
 GLYPH = {
     (chess.PAWN, chess.WHITE): "\u2659",
@@ -272,14 +276,18 @@ class PieceRenderer:
         self.square = square
         self.font: pygame.font.Font | None = None
         self.cache: dict[tuple[int, bool], pygame.Surface] = {}
-        self._pick_font(int(square * 0.78))
+        self._pick_font(int(square * 0.62))
 
     def _pick_font(self, size: int) -> None:
+        # NOTE: order matters — "arialunicode" is the one that actually has
+        # chess glyphs on macOS. Don't put segoe/symbola first: SysFont will
+        # happily return a fallback font without chess coverage and every
+        # piece renders as tofu boxes.
         for name in ("arialunicode", "arial", "menlo", "dejavusans", "freesans"):
             try:
                 f = pygame.font.SysFont(name, size)
                 # probe render
-                if f.render("\u265a", True, (0, 0, 0)).get_width() > 4:
+                if f.render("♚", True, (0, 0, 0)).get_width() > 4:
                     self.font = f
                     return
             except Exception:
@@ -290,7 +298,7 @@ class PieceRenderer:
         if square != self.square:
             self.square = square
             self.cache.clear()
-            self._pick_font(int(square * 0.78))
+            self._pick_font(int(square * 0.62))
 
     def get(self, piece_type: int, color: bool) -> pygame.Surface:
         key = (piece_type, color)
@@ -298,24 +306,23 @@ class PieceRenderer:
             return self.cache[key]
         assert self.font is not None
         glyph = GLYPH[(piece_type, color)]
-        fill = (248, 248, 250) if color == chess.WHITE else (24, 24, 30)
-        outline = (30, 30, 38) if color == chess.WHITE else (238, 238, 245)
-        # White pieces get a warm golden tint shadow; black a cool one.
+        # Soft, low-contrast palette: off-white pieces with warm grey edge,
+        # dark slate pieces with light edge. Thin 1px outline keeps glyphs crisp.
+        fill = (250, 250, 252) if color == chess.WHITE else (38, 38, 48)
+        outline = (74, 74, 88) if color == chess.WHITE else (232, 232, 240)
         base = self.font.render(glyph, True, fill)
         edge = self.font.render(glyph, True, outline)
-        w = base.get_width() + 6
-        h = base.get_height() + 6
+        w = base.get_width() + 4
+        h = base.get_height() + 4
         surf = pygame.Surface((w, h), pygame.SRCALPHA)
-        cx, cy = 3, 3
-        for dx in (-2, -1, 0, 1, 2):
-            for dy in (-2, -1, 0, 1, 2):
-                if dx == 0 and dy == 0:
-                    continue
-                surf.blit(edge, (cx + dx, cy + dy))
+        cx, cy = 2, 2
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            surf.blit(edge, (cx + dx, cy + dy))
         surf.blit(base, (cx, cy))
-        # soft drop shadow
-        shadow = pygame.Surface((w, h), pygame.SRCALPHA)
-        shadow.blit(self.font.render(glyph, True, (0, 0, 0, 90)), (cx + 2, cy + 3))
+        # subtle drop shadow
+        shadow = pygame.Surface((w + 2, h + 4), pygame.SRCALPHA)
+        shadow.blit(self.font.render(glyph, True, (0, 0, 0, 70)), (cx + 1, cy + 3))
         shadow.blit(surf, (0, 0))
         self.cache[key] = shadow
         return shadow
@@ -387,7 +394,7 @@ class ChessGame:
         self.coach_score = 0
         self.coach_streak = 0
         self.coach_best_streak = 0
-        self.grades: list[coach.Grade] = []
+        self.grades: list[tuple[int, coach.Grade]] = []  # (ply, grade): humans only
         self.last_grade: coach.Grade | None = None
         self.grade_thread: threading.Thread | None = None
         self.grading_busy = False
@@ -399,7 +406,10 @@ class ChessGame:
         self.puzzle_mode = False
         self.puzzle_idx = -1
         self.puzzle: dict | None = None
-        self.puzzle_rating = coach.load_rating()
+        self.profile = profile_mod.load()
+        self.puzzle_rating = self.profile.get("puzzle_rating", profile_mod.PUZZLE_START)
+        self.subject_id: str = self.profile.get("subject_id", "unknown")
+        self.session_id: str = uuid.uuid4().hex[:8]
         self.puzzle_status = ""  # solving | opp | solved | failed
         self.puzzle_ply = 0  # index into solution: even = your move
         self.pending_reply: tuple[chess.Move, float] | None = None
@@ -407,13 +417,47 @@ class ChessGame:
         self.seen_puzzle_ids: set[str] = set()
         self.seen_puzzles: set[int] = set()  # legacy sample idxs
         self.puzzle_pool: list[dict] = coach.load_puzzle_file() or coach.sample_pool()
+        # timed tiers + research timing
+        self.puzzle_tier = "medium"
+        self.puzzle_deadline = 0.0
+        self.puzzle_attempts = 0
+        self._pos_shown_at = time.time()
+        self._puzzle_start_at = time.time()
+        self._pending_meta: dict | None = None
+        self._grade_meta: dict[int, dict] = {}  # ply -> timing, game moves
+        self._spar_meta: dict | None = None
+        self._hint_used = False
+        self._hint_used_total = False
+        self._seen_before = False
+        self._second_chance_used = False
+        self._fail_uci: str | None = None
+        self._fail_at = 0.0
+        self._solve_pending = False
+        self._solve_at = 0.0
+        self._first_label: str | None = None
+        self._prev_grade: str | None = None
+        self._prev_loss: int | None = None
         # gameplay AI strength + live sparring (Stockfish on the other side)
-        self.ai_level = "medium"
+        self.ai_level = "auto"  # auto = adaptive ladder; or easy/medium/hard
         self.spar_mode = False
         self.spar_target = 0  # player moves to survive
         self.spar_moves = 0
         self.spar_pending_compute = False
         self._spar_judge_pending = False
+        # rated play (game rating vs ladder AI)
+        self.game_ai: dict | None = None  # {"name","rating"} snapshot at game start
+        self.game_rated = False
+        self._game_n = 0
+        self._game_id = ""
+        self._game_start_at = time.time()
+        # screens: home | tiers | profile | play | puzzle
+        self.screen_state = "home"
+        self.study_screen = None
+        self.study_options: dict = {}
+        self.home_tiles: list[tuple[pygame.Rect, str]] = []
+        self.tier_cards: list[tuple[pygame.Rect, str]] = []
+        self.home_button = pygame.Rect(0, 0, 0, 0)
+        self.back_button = pygame.Rect(0, 0, 0, 0)
         self.font_title = pygame.font.SysFont("helveticaneue", 30, bold=True)
         self.font_ui = pygame.font.SysFont("helveticaneue", 18)
         self.font_ui_b = pygame.font.SysFont("helveticaneue", 18, bold=True)
@@ -427,13 +471,18 @@ class ChessGame:
 
     # -- layout ---------------------------------------------------------
     def _layout_buttons(self) -> None:
-        x, y, w, h, gap = PANEL_X, 0, (PANEL_W - 8) // 2, 38, 8
-        y = WIN_H - 56
+        # Buttons sit inside the panel with padding so nothing overflows.
+        # Panel spans BOARD_Y-8 .. BOARD_Y+BOARD_PX+8 (bottom = 728).
+        panel_bottom = BOARD_Y + BOARD_PX + 8
+        w, h, gap = (PANEL_W - 8) // 2, 36, 8
+        x = PANEL_X
+        y_bottom = panel_bottom - 30 - h  # 30px reserved for footer line
+        y_top = y_bottom - gap - h
         self.buttons = [
-            Button(pygame.Rect(x, y - 48, w, h), "↺ New (N)", "new"),
-            Button(pygame.Rect(x + w + 8, y - 48, w, h), "⟲ Undo (U)", "undo"),
-            Button(pygame.Rect(x, y, w, h), "⇄ Flip (F)", "flip"),
-            Button(pygame.Rect(x + w + 8, y, w, h), "♪ Sound: On", "sound"),
+            Button(pygame.Rect(x, y_top, w, h), "New (N)", "new"),
+            Button(pygame.Rect(x + w + 8, y_top, w, h), "Undo (U)", "undo"),
+            Button(pygame.Rect(x, y_bottom, w, h), "Flip (F)", "flip"),
+            Button(pygame.Rect(x + w + 8, y_bottom, w, h), "Sound: On", "sound"),
         ]
         # AI mode button lives near top of panel; handled as separate rect.
         self.ai_button = pygame.Rect(PANEL_X, 148, PANEL_W, 36)
@@ -516,7 +565,7 @@ class ChessGame:
         return False
 
     def human_can_move(self) -> bool:
-        if self.puzzle_mode and self.puzzle_status in ("solved", "failed"):
+        if self.puzzle_mode and self.puzzle_status in ("solved", "failed", "failed_pending"):
             return False
         if self.spar_mode and self.puzzle_status in ("solved", "failed"):
             return False
@@ -636,9 +685,29 @@ class ChessGame:
         else:
             self.sound.move()
 
-        # --- Coach grading (background, ChessTempo-style) -----------------
-        if self.coach_enabled and coach_grade:
+        # --- Coach grading: HUMAN moves only (never the AI's) ---------------
+        if self._should_grade(before_board.turn, coach_grade):
             self._request_grade(before_board, move)
+
+        # --- Rated-game snapshot (adaptive AI rung, once per game) ---------
+        if (self.game_ai is None and self.mode in ("AI_BLACK", "AI_WHITE")
+                and not self.puzzle_mode and not self.spar_mode
+                and not self.game_over_text):
+            rung = self.matched_rung()
+            self._game_n += 1
+            self._game_id = f"game-{self.session_id}-{self._game_n}"
+            self._game_start_at = time.time()
+            self.game_ai = {"name": rung["name"], "rating": rung["rating"]}
+            self.game_rated = False
+        if not self.puzzle_mode and not self.spar_mode:
+            # deliberation clock for game moves (captured now; the grade
+            # lands later, after the AI has already replied)
+            now = time.time()
+            self._grade_meta[len(self.board.move_stack)] = {
+                "ms_delib": int((now - self._pos_shown_at) * 1000),
+                "ms_total": int((now - self._game_start_at) * 1000),
+            }
+            self._pos_shown_at = now
 
         # --- Puzzle exact-match flow (Lichess-style lines) -----------------
         if self.puzzle_mode and self.puzzle is not None and not is_opponent_reply:
@@ -648,6 +717,7 @@ class ChessGame:
             sol = (self.puzzle.get("solution") or []) if self.puzzle else []
             if self.puzzle_status == "solving" and self.puzzle_ply >= len(sol):
                 self._puzzle_solved()
+            self._pos_shown_at = time.time()  # fresh position for timing
 
         # --- Sparring flow (live Stockfish opponent) -----------------------
         if self.spar_mode and coach_grade and self.puzzle is not None:
@@ -659,27 +729,45 @@ class ChessGame:
                 self._spar_failed("No win — draw")
 
     # -- coach ----------------------------------------------------------
+    def _mover_is_human(self, color: bool) -> bool:
+        """AI-held sides never earn the user points."""
+        if self.mode == "AI_BLACK" and color == chess.BLACK:
+            return False
+        if self.mode == "AI_WHITE" and color == chess.WHITE:
+            return False
+        return True
+
+    def _should_grade(self, mover_color: bool, coach_grade: bool) -> bool:
+        if not self.coach_enabled or not coach_grade:
+            return False
+        if self.puzzle_mode or self.spar_mode:
+            return True  # only the player's moves reach here (replies skip)
+        return self._mover_is_human(mover_color)
+
     def _request_grade(self, before: chess.Board, played: chess.Move) -> None:
         if self.grading_busy:
             return
         self.grading_busy = True
         snapshot = before.copy()
         mv = played
+        ply = len(self.board.move_stack)  # grade sticks to this position
 
         def worker() -> None:
             try:
                 g = self.coach.grade(snapshot, mv, time_s=0.3, depth=14)
             except Exception:
                 g = None
-            self._apply_grade(g, mv)
+            self._apply_grade(g, mv, ply)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_grade(self, g: coach.Grade | None, played: chess.Move) -> None:
+    def _apply_grade(self, g: coach.Grade | None, played: chess.Move, ply: int = -1) -> None:
         self.grading_busy = False
         if g is None:
             return
-        self.grades.append(g)
+        if ply < 0:
+            ply = len(self.board.move_stack)
+        self.grades.append((ply, g))
         self.last_grade = g
         # score + streak (good moves build streak bonus)
         if g.points > 0:
@@ -715,19 +803,64 @@ class ChessGame:
         if (self.puzzle_mode and self.puzzle is not None
                 and self.puzzle_status == "solving"
                 and not self.puzzle.get("solution")):
+            self._pending_meta = self._pending_meta or {
+                "uci": played.uci(), "attempt_no": self.puzzle_attempts + 1,
+                "move_no_in_line": 1,
+                "ms_delib": int((time.time() - self._pos_shown_at) * 1000),
+                "ms_total": int((time.time() - self._puzzle_start_at) * 1000),
+                "clock_left_ms": int(max(0.0, self.puzzle_deadline - time.time()) * 1000),
+                "hint_used": self._hint_used,
+            }
+            self.puzzle_attempts += 1
+            self._hint_used = False
             solved = g.cp_loss <= 30
             if solved:
                 self.puzzle_status = "solved"
-                self.puzzle_rating = coach.update_rating(
-                    self.puzzle_rating, self.puzzle["rating"], True)
+                self._solve_pending = True
+                self._solve_at = time.time()
+                self._first_label = g.label
+                self.sound.promote()
+                self.toast = ("Solved!", (110, 200, 130),
+                              (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), time.time())
             else:
-                self.puzzle_status = "failed"
-                self.puzzle_rating = coach.update_rating(
-                    self.puzzle_rating, self.puzzle["rating"], False)
-            coach.save_rating(self.puzzle_rating)
-            self.seen_puzzles.add(self.puzzle_idx)
-            if self.puzzle:
-                self.seen_puzzle_ids.add(str(self.puzzle.get("id")))
+                self._fail_uci = g.best_uci
+                self._fail_at = time.time()
+                self.puzzle_status = "failed_pending"
+                self.toast = ("Not it…", (240, 200, 90),
+                              (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), time.time())
+        # research: log every graded player attempt (puzzle / spar / game)
+        self._log_graded_attempt(g, played, ply)
+        # partial credit: wrong-but-decent first try → +3 + second chance
+        if (self.puzzle_mode and self.puzzle_status == "failed_pending"
+                and not self._second_chance_used and self._pending_meta
+                and self._pending_meta.get("attempt_no", 2) == 1
+                and g.label in ("Best", "Excellent", "Good")
+                and g.cp_loss <= profile_mod.VALID_LOSS_MAX):
+            self._second_chance_used = True
+            self.puzzle_status = "solving"
+            self.best_arrow = None  # keep the challenge: no free answer
+            self.coach_score += profile_mod.VALID_POINTS
+            self.profile["points_total"] = self.profile.get("points_total", 0) + profile_mod.VALID_POINTS
+            profile_mod.save(self.profile)
+            self._pending_meta["points"] = profile_mod.VALID_POINTS
+            self.toast = (f"Valid +{profile_mod.VALID_POINTS} — find the best!",
+                          (240, 200, 90), (BOARD_X + BOARD_PX / 2, BOARD_Y + 70),
+                          time.time())
+            self.sound.select()
+        elif self.puzzle_mode and self.puzzle_status == "failed_pending":
+            # grade confirms the miss (or second chance already used) → fail
+            meta_uci = self._fail_uci or played.uci()
+            try:
+                before = self._reconstruct_before(played)
+                self._puzzle_failed(meta_uci, before)
+            except Exception:
+                if self.puzzle is not None:
+                    self._puzzle_failed(meta_uci, self.board)
+        # first-attempt label powers the +10% Best bonus at solve time
+        if self._pending_meta and self._pending_meta.get("attempt_no") == 1:
+            self._first_label = g.label
+        self._prev_grade, self._prev_loss = g.label, g.cp_loss
+        self._pending_meta = None
         # sparring judgement — survive without Mistake/Blunder
         if (self.spar_mode and self._spar_judge_pending
                 and self.puzzle_status == "solving"):
@@ -736,6 +869,111 @@ class ChessGame:
                 self._spar_failed(f"{g.label} {g.points:+d}")
             elif self.spar_moves < self.spar_target:
                 self._request_spar_reply()
+
+    def _reconstruct_before(self, played: chess.Move) -> chess.Board:
+        """Board before the last push (for SAN of the expected move)."""
+        b = self.board.copy()
+        try:
+            b.pop()
+        except Exception:
+            pass
+        return b
+
+    def _puzzle_failed_engine(self, timeout: bool = False) -> None:
+        """Terminal fail for engine-judged puzzles (no reference line)."""
+        self.puzzle_status = "failed"
+        self.pending_reply = None
+        assert self.puzzle is not None
+        tier = self.puzzle_tier
+        now = time.time()
+        pr_before = self.profile.get("puzzle_rating", profile_mod.PUZZLE_START)
+        delta = profile_mod.rate_puzzle(self.profile, self.puzzle["rating"], False, tier=tier)
+        self.puzzle_rating = self.profile["puzzle_rating"]
+        self.seen_puzzle_ids.add(str(self.puzzle.get("id")))
+        self.coach_streak = 0
+        reason = "Time!" if timeout else "Miss"
+        self.toast = (f"{reason} · Elo {self.puzzle_rating}", (235, 90, 90),
+                      (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), now)
+        profile_mod.log_attempt({
+            "v": 1, "kind": "puzzle_result", "subject": self.subject_id,
+            "session": self.session_id, "mode": "puzzle",
+            "calibration": profile_mod.calibration_puzzle(self.profile),
+            "puzzle_id": str(self.puzzle.get("id")), "puzzle_rating": self.puzzle["rating"],
+            "tier": tier, "solution_len": 0, "seen_before": self._seen_before,
+            "solved": False, "timeout": timeout, "terminal": True, "points": 0,
+            "attempts": self.puzzle_attempts,
+            "ms_total": int((now - self._puzzle_start_at) * 1000),
+            "pr_before": pr_before, "pr_after": self.puzzle_rating, "pr_delta": delta,
+        })
+        self.sound.capture()
+
+    def _log_graded_attempt(self, g: coach.Grade, played: chess.Move, ply: int = -1) -> None:
+        """One detailed research row per graded player move (never raises)."""
+        try:
+            now = time.time()
+            meta = self._pending_meta or {}
+            if self.puzzle_mode and self.puzzle is not None:
+                profile_mod.log_attempt({
+                    "v": 1, "kind": "attempt", "subject": self.subject_id,
+                    "session": self.session_id, "mode": "puzzle",
+                    "calibration": profile_mod.calibration_puzzle(self.profile),
+                    "puzzle_id": str(self.puzzle.get("id")),
+                    "puzzle_rating": self.puzzle["rating"], "tier": self.puzzle_tier,
+                    "solution_len": len(self.puzzle.get("solution") or []),
+                    "seen_before": self._seen_before,
+                    "hint_used": meta.get("hint_used", False),
+                    "attempt_no": meta.get("attempt_no", self.puzzle_attempts),
+                    "move_no_in_line": meta.get("move_no_in_line", 0),
+                    "uci": played.uci(), "san": g.played_san, "grade": g.label,
+                    "cp_loss": g.cp_loss, "eval_played": g.played_eval,
+                    "eval_best": g.best_eval,
+                    "ms_delib": meta.get("ms_delib"), "ms_total": meta.get("ms_total"),
+                    "clock_left_ms": meta.get("clock_left_ms"),
+                    "clock_total_ms": profile_mod.TIERS[self.puzzle_tier]["time"] * 1000,
+                    "prev_grade": self._prev_grade, "prev_loss": self._prev_loss,
+                    "points": meta.get("points", 0),
+                    "user_pr_before": self.profile.get("puzzle_rating"),
+                })
+            elif self.spar_mode and self.puzzle is not None:
+                smeta = self._spar_meta or {}
+                profile_mod.log_attempt({
+                    "v": 1, "kind": "attempt", "subject": self.subject_id,
+                    "session": self.session_id, "mode": "spar",
+                    "calibration": profile_mod.calibration_puzzle(self.profile),
+                    "puzzle_id": str(self.puzzle.get("id")),
+                    "puzzle_rating": self.puzzle["rating"],
+                    "tier": profile_mod.tier_of(int(self.puzzle.get("rating", 1200))),
+                    "seen_before": self._seen_before,
+                    "hint_used": self._hint_used,
+                    "move_no_in_line": self.spar_moves,
+                    "uci": played.uci(), "san": g.played_san, "grade": g.label,
+                    "cp_loss": g.cp_loss, "eval_played": g.played_eval,
+                    "eval_best": g.best_eval,
+                    "ms_delib": smeta.get("ms_delib"),
+                    "ms_total": smeta.get("ms_total"),
+                    "prev_grade": self._prev_grade, "prev_loss": self._prev_loss,
+                    "user_pr_before": self.profile.get("puzzle_rating"),
+                })
+                self._hint_used = False
+                self._spar_meta = None
+            elif self.game_ai is not None and not self.puzzle_mode and not self.spar_mode:
+                gmeta = self._grade_meta.pop(ply, {})
+                profile_mod.log_attempt({
+                    "v": 1, "kind": "game_move", "subject": self.subject_id,
+                    "session": self.session_id, "mode": "game",
+                    "calibration": profile_mod.calibration_game(self.profile),
+                    "game_id": self._game_id, "ai_name": self.game_ai.get("name"),
+                    "ai_rating": self.game_ai.get("rating"), "tier": "game",
+                    "uci": played.uci(), "san": g.played_san, "grade": g.label,
+                    "cp_loss": g.cp_loss, "eval_played": g.played_eval,
+                    "eval_best": g.best_eval,
+                    "ms_delib": gmeta.get("ms_delib"),
+                    "ms_total": gmeta.get("ms_total"),
+                    "prev_grade": self._prev_grade, "prev_loss": self._prev_loss,
+                    "user_pr_before": self.profile.get("game_rating"),
+                })
+        except Exception:
+            pass
 
     def show_hint(self) -> None:
         """Hint (H): best arrow for 3s, costs 5 pts. In puzzles: the solution."""
@@ -750,6 +988,8 @@ class ChessGame:
                     return
                 self.best_arrow = (mv.from_square, mv.to_square, time.time() + 3.0)
                 self.coach_score -= 5
+                self._hint_used = True  # logged; voids the +10% bonus
+                self._hint_used_total = True
                 cx, cy = self.square_center(mv.to_square)
                 self.toast = ("Hint (-5)", (129, 182, 255), (cx, cy), time.time())
                 self.sound.select()
@@ -764,6 +1004,8 @@ class ChessGame:
             return
         self.best_arrow = (best.from_square, best.to_square, time.time() + 3.0)
         self.coach_score -= 5
+        if self.spar_mode:
+            self._hint_used = True
         try:
             san = self.board.san(best)
         except Exception:
@@ -779,9 +1021,20 @@ class ChessGame:
         sol = self.puzzle.get("solution")
         if not sol or self.puzzle_status != "solving":
             return  # engine-judged fallback handled via grades
-        expected_uci = sol[self.puzzle_ply] if self.puzzle_ply < len(sol) else None
-        if expected_uci is None:
+        if self.puzzle_ply >= len(sol):
             return
+        now = time.time()
+        self.puzzle_attempts += 1
+        self._pending_meta = {
+            "uci": played.uci(), "attempt_no": self.puzzle_attempts,
+            "move_no_in_line": self.puzzle_ply + 1,
+            "ms_delib": int((now - self._pos_shown_at) * 1000),
+            "ms_total": int((now - self._puzzle_start_at) * 1000),
+            "clock_left_ms": int(max(0.0, self.puzzle_deadline - now) * 1000),
+            "hint_used": self._hint_used,
+        }
+        self._hint_used = False
+        expected_uci = sol[self.puzzle_ply]
         mate_alt = (
             "mateIn1" in (self.puzzle.get("themes") or [])
             and self.board.is_checkmate()
@@ -801,32 +1054,74 @@ class ChessGame:
                 except Exception:
                     self._puzzle_solved()
         else:
-            self._puzzle_failed(expected_uci, before)
+            # don't finalize yet: the grade (~0.5s) decides fail vs +3 second chance
+            self.puzzle_status = "failed_pending"
+            self._fail_uci = expected_uci
+            self._fail_at = now
+            try:
+                exp = chess.Move.from_uci(expected_uci)
+                self.best_arrow = (exp.from_square, exp.to_square, time.time() + 8.0)
+            except Exception:
+                pass
+            self.toast = ("Not it…", (240, 200, 90),
+                          (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), now)
 
     def _puzzle_solved(self) -> None:
         self.puzzle_status = "solved"
         self.pending_reply = None
-        self.puzzle_rating = coach.update_rating(
-            self.puzzle_rating, self.puzzle["rating"], True)
-        coach.save_rating(self.puzzle_rating)
-        if self.puzzle:
-            self.seen_puzzle_ids.add(str(self.puzzle.get("id")))
-        self.coach_score += 15
+        self._solve_pending = True
+        self._solve_at = time.time()
+        self.sound.promote()
+        self.toast = ("Solved!", (110, 200, 130),
+                      (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), time.time())
+
+    def _finalize_puzzle_solve(self) -> None:
+        """Rating + points + terminal log once the first grade lands (bonus needs it)."""
+        self._solve_pending = False
+        if self.puzzle is None:
+            return
+        assert self.puzzle is not None
+        tier = self.puzzle_tier
+        now = time.time()
+        seconds_left = max(0.0, self.puzzle_deadline - now)
+        first_try_best = (self.puzzle_attempts <= 1 and self._first_label == "Best"
+                          and not self._second_chance_used and not self._hint_used_total)
+        points = profile_mod.solve_points(tier, seconds_left, first_try_best)
+        pr_before = self.profile.get("puzzle_rating", profile_mod.PUZZLE_START)
+        delta = profile_mod.rate_puzzle(self.profile, self.puzzle["rating"], True, tier=tier)
+        self.puzzle_rating = self.profile["puzzle_rating"]
+        self.profile["points_total"] = self.profile.get("points_total", 0) + points
+        profile_mod.save(self.profile)
+        self.seen_puzzle_ids.add(str(self.puzzle.get("id")))
+        self.coach_score += points
         self.coach_streak += 1
         self.coach_best_streak = max(self.coach_best_streak, self.coach_streak)
-        cx = BOARD_X + BOARD_PX / 2
-        self.toast = (f"Solved! +15 · ★{self.puzzle_rating}", (110, 200, 130),
-                      (cx, BOARD_Y + 70), time.time())
-        self.sound.promote()
+        self.toast = (f"Solved! +{points} · Elo {self.puzzle_rating}", (110, 200, 130),
+                      (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), now)
+        profile_mod.log_attempt({
+            "v": 1, "kind": "puzzle_result", "subject": self.subject_id,
+            "session": self.session_id, "mode": "puzzle",
+            "calibration": profile_mod.calibration_puzzle(self.profile),
+            "puzzle_id": str(self.puzzle.get("id")), "puzzle_rating": self.puzzle["rating"],
+            "tier": tier, "solution_len": len(self.puzzle.get("solution") or []),
+            "seen_before": self._seen_before, "solved": True, "timeout": False,
+            "terminal": True, "points": points, "first_try_best": first_try_best,
+            "attempts": self.puzzle_attempts,
+            "ms_total": int((now - self._puzzle_start_at) * 1000),
+            "pr_before": pr_before, "pr_after": self.puzzle_rating, "pr_delta": delta,
+        })
 
-    def _puzzle_failed(self, expected_uci: str, before: chess.Board) -> None:
+    def _puzzle_failed(self, expected_uci: str, before: chess.Board,
+                       reason: str = "Miss", timeout: bool = False) -> None:
         self.puzzle_status = "failed"
         self.pending_reply = None
-        self.puzzle_rating = coach.update_rating(
-            self.puzzle_rating, self.puzzle["rating"], False)
-        coach.save_rating(self.puzzle_rating)
-        if self.puzzle:
-            self.seen_puzzle_ids.add(str(self.puzzle.get("id")))
+        assert self.puzzle is not None
+        tier = self.puzzle_tier
+        now = time.time()
+        pr_before = self.profile.get("puzzle_rating", profile_mod.PUZZLE_START)
+        delta = profile_mod.rate_puzzle(self.profile, self.puzzle["rating"], False, tier=tier)
+        self.puzzle_rating = self.profile["puzzle_rating"]
+        self.seen_puzzle_ids.add(str(self.puzzle.get("id")))
         self.coach_streak = 0
         try:
             exp = chess.Move.from_uci(expected_uci)
@@ -835,12 +1130,32 @@ class ChessGame:
                 san = before.san(exp)
             except Exception:
                 san = expected_uci
-            self.toast = (f"Miss — was {san} · ★{self.puzzle_rating}",
-                          (235, 90, 90), (BOARD_X + BOARD_PX / 2, BOARD_Y + 70),
-                          time.time())
+            self.toast = (f"{reason} — was {san} · Elo {self.puzzle_rating}",
+                          (235, 90, 90), (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), now)
         except Exception:
             pass
+        profile_mod.log_attempt({
+            "v": 1, "kind": "puzzle_result", "subject": self.subject_id,
+            "session": self.session_id, "mode": "puzzle",
+            "calibration": profile_mod.calibration_puzzle(self.profile),
+            "puzzle_id": str(self.puzzle.get("id")), "puzzle_rating": self.puzzle["rating"],
+            "tier": tier, "solution_len": len(self.puzzle.get("solution") or []),
+            "seen_before": self._seen_before, "solved": False, "timeout": timeout,
+            "terminal": True, "points": 0, "attempts": self.puzzle_attempts,
+            "ms_total": int((now - self._puzzle_start_at) * 1000),
+            "pr_before": pr_before, "pr_after": self.puzzle_rating, "pr_delta": delta,
+        })
         self.sound.capture()
+
+    def _puzzle_timeout(self) -> None:
+        if not (self.puzzle_mode and self.puzzle_status == "solving"):
+            return
+        sol = (self.puzzle or {}).get("solution") or []
+        exp_uci = sol[self.puzzle_ply] if self.puzzle_ply < len(sol) else None
+        if exp_uci is None:  # engine-judged: fail without a reference move
+            self._puzzle_failed_engine(timeout=True)
+            return
+        self._puzzle_failed(exp_uci, self.board, reason="Time!", timeout=True)
 
     def fire_pending_reply(self) -> None:
         if self.pending_reply is None or self.anims:
@@ -851,6 +1166,7 @@ class ChessGame:
         self.pending_reply = None
         if self.puzzle_status == "solving" and reply in self.board.legal_moves:
             self.push_move(reply, coach_grade=False)
+            self._pos_shown_at = time.time()
 
     # -- sparring (live Stockfish on the other side) ------------------------
     def enter_spar(self) -> None:
@@ -887,13 +1203,18 @@ class ChessGame:
         self._spar_judge_pending = False
         self._load_puzzle(p)
         themes = " ".join((p.get("themes") or ["tactic"])[:2])
-        self.toast = (f"SPAR {themes} · survive {self.spar_target} · ★{p.get('rating', '?')}",
+        self.toast = (f"SPAR {themes} · survive {self.spar_target} · {p.get('rating', '?')}",
                       (129, 182, 255), (BOARD_X + BOARD_PX / 2, BOARD_Y + 60),
                       time.time())
 
     def _spar_after_player_move(self, played: chess.Move) -> None:
         if self.puzzle_status != "solving":
             return
+        now = time.time()
+        self._spar_meta = {
+            "ms_delib": int((now - self._pos_shown_at) * 1000),
+            "ms_total": int((now - self._puzzle_start_at) * 1000),
+        }
         if self.board.is_checkmate():
             self._spar_solved("Mate! +15")
             return
@@ -934,16 +1255,29 @@ class ChessGame:
         self.pending_reply = None
         self.spar_pending_compute = False
         self._spar_judge_pending = False
-        self.puzzle_rating = coach.update_rating(
-            self.puzzle_rating, (self.puzzle or {}).get("rating", 1200), True)
-        coach.save_rating(self.puzzle_rating)
+        now = time.time()
+        pr = (self.puzzle or {}).get("rating", 1200)
+        pr_before = self.profile.get("puzzle_rating", profile_mod.PUZZLE_START)
+        delta = profile_mod.rate_puzzle(self.profile, pr, True)
+        self.puzzle_rating = self.profile["puzzle_rating"]
         if self.puzzle:
             self.seen_puzzle_ids.add(str(self.puzzle.get("id")))
         self.coach_score += 15
         self.coach_streak += 1
         self.coach_best_streak = max(self.coach_best_streak, self.coach_streak)
-        self.toast = (f"{msg} · ★{self.puzzle_rating}", (110, 200, 130),
-                      (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), time.time())
+        self.toast = (f"{msg} · Elo {self.puzzle_rating}", (110, 200, 130),
+                      (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), now)
+        profile_mod.log_attempt({
+            "v": 1, "kind": "spar_result", "subject": self.subject_id,
+            "session": self.session_id, "mode": "spar",
+            "calibration": profile_mod.calibration_puzzle(self.profile),
+            "puzzle_id": str((self.puzzle or {}).get("id")),
+            "puzzle_rating": pr, "tier": profile_mod.tier_of(int(pr)),
+            "seen_before": self._seen_before, "solved": True, "timeout": False,
+            "terminal": True, "points": 15, "moves": self.spar_moves,
+            "ms_total": int((now - self._puzzle_start_at) * 1000),
+            "pr_before": pr_before, "pr_after": self.puzzle_rating, "pr_delta": delta,
+        })
         self.sound.promote()
 
     def _spar_failed(self, msg: str) -> None:
@@ -951,16 +1285,29 @@ class ChessGame:
         self.pending_reply = None
         self.spar_pending_compute = False
         self._spar_judge_pending = False
-        self.puzzle_rating = coach.update_rating(
-            self.puzzle_rating, (self.puzzle or {}).get("rating", 1200), False)
-        coach.save_rating(self.puzzle_rating)
+        now = time.time()
+        pr = (self.puzzle or {}).get("rating", 1200)
+        pr_before = self.profile.get("puzzle_rating", profile_mod.PUZZLE_START)
+        delta = profile_mod.rate_puzzle(self.profile, pr, False)
+        self.puzzle_rating = self.profile["puzzle_rating"]
         if self.puzzle:
             self.seen_puzzle_ids.add(str(self.puzzle.get("id")))
         self.coach_streak = 0
         if self.board.is_checkmate() and self.board.turn != chess.WHITE:
             pass  # player got mated; board says it all
-        self.toast = (f"{msg} · ★{self.puzzle_rating}", (235, 90, 90),
-                      (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), time.time())
+        self.toast = (f"{msg} · Elo {self.puzzle_rating}", (235, 90, 90),
+                      (BOARD_X + BOARD_PX / 2, BOARD_Y + 70), now)
+        profile_mod.log_attempt({
+            "v": 1, "kind": "spar_result", "subject": self.subject_id,
+            "session": self.session_id, "mode": "spar",
+            "calibration": profile_mod.calibration_puzzle(self.profile),
+            "puzzle_id": str((self.puzzle or {}).get("id")),
+            "puzzle_rating": pr, "tier": profile_mod.tier_of(int(pr)),
+            "seen_before": self._seen_before, "solved": False, "timeout": False,
+            "terminal": True, "points": 0, "moves": self.spar_moves,
+            "ms_total": int((now - self._puzzle_start_at) * 1000),
+            "pr_before": pr_before, "pr_after": self.puzzle_rating, "pr_delta": delta,
+        })
         self.sound.capture()
 
     def enter_puzzle(self) -> None:
@@ -995,18 +1342,38 @@ class ChessGame:
         self.puzzle_ply = 0
         self.pending_reply = None
         self.best_arrow = None
+        self._solve_pending = False
+        self._pending_meta = None
         self.new_game()
 
-    def _load_puzzle(self, p: dict) -> None:
+    def _load_puzzle(self, p: dict, tier: str | None = None) -> None:
         self.puzzle = p
         self.puzzle_status = "solving"
         self.puzzle_ply = 0
         self.pending_reply = None
+        now = time.time()
+        self.puzzle_tier = tier or profile_mod.tier_of(int(p.get("rating", 1200)))
+        self.puzzle_deadline = now + profile_mod.TIERS[self.puzzle_tier]["time"]
+        self.puzzle_attempts = 0
+        self._pos_shown_at = now
+        self._puzzle_start_at = now
+        self._pending_meta = None
+        self._hint_used = False
+        self._hint_used_total = False
+        self._seen_before = str(p.get("id")) in self.seen_puzzle_ids
+        self._second_chance_used = False
+        self._fail_uci = None
+        self._solve_pending = False
+        self._first_label = None
+        self._prev_grade = None
+        self._prev_loss = None
+        self.screen_state = "puzzle"
         try:
             self.board.set_fen(p["fen"])
         except Exception:
             self.board.reset()
-        self.orientation_white = self.board.turn == chess.WHITE
+        # NOTE: orientation is deliberately left alone — auto-flipping the
+        # board on every puzzle was disorienting. Press F to flip.
         self.san_history.clear()
         self.grades.clear()
         self.last_grade = None
@@ -1015,27 +1382,44 @@ class ChessGame:
         self.legal_for_selected = []
         self.anims.clear()
         self.best_arrow = None
-        themes = " ".join((p.get("themes") or ["tactic"])[:2])
-        n = len(p.get("solution") or [])
-        info = f"{themes} · {p.get('rating', '?')} · {n} moves" if n else \
-            f"{themes} · {p.get('rating', '?')}"
-        self.toast = (info, (235, 235, 245),
-                      (BOARD_X + BOARD_PX / 2, BOARD_Y + 60), time.time())
+        # No info toast: theme/rating/clock already live in the coach box and
+        # banner, and a toast here just covered the top ranks.
+        self.toast = None
         self._refresh_check_state()
 
     def _next_puzzle(self) -> None:
         if not self.puzzle_pool:
             self.puzzle_pool = coach.sample_pool()
+        pool = [p for p in self.puzzle_pool
+                if profile_mod.tier_of(int(p.get("rating", 1200))) == self.puzzle_tier]
+        if not pool:
+            pool = self.puzzle_pool
         try:
-            _, p = coach.pick_from_pool(self.puzzle_pool, self.puzzle_rating,
+            _, p = coach.pick_from_pool(pool, self.puzzle_rating,
                                         self.seen_puzzle_ids or None)
         except Exception:
-            p = self.puzzle_pool[0]
-        if (len(self.seen_puzzle_ids) >= len(self.puzzle_pool)
-                and len(self.puzzle_pool) > 1):
+            p = pool[0]
+        if len(self.seen_puzzle_ids) >= len(pool) and len(pool) > 1:
             self.seen_puzzle_ids.clear()
-            _, p = coach.pick_from_pool(self.puzzle_pool, self.puzzle_rating, None)
-        self._load_puzzle(p)
+            _, p = coach.pick_from_pool(pool, self.puzzle_rating, None)
+        self._load_puzzle(p, tier=self.puzzle_tier)
+
+    def enter_tier(self, tier: str) -> None:
+        self.puzzle_mode = True
+        self.spar_mode = False
+        self.puzzle_tier = tier
+        if not self.puzzle_pool:
+            self.puzzle_pool = coach.sample_pool()
+        pool = [p for p in self.puzzle_pool
+                if profile_mod.tier_of(int(p.get("rating", 1200))) == tier]
+        if not pool:
+            pool = self.puzzle_pool
+        try:
+            _, p = coach.pick_from_pool(pool, self.puzzle_rating,
+                                        self.seen_puzzle_ids or None)
+        except Exception:
+            p = pool[0]
+        self._load_puzzle(p, tier=tier)
 
     def undo(self) -> None:
         if self.anims or self.ai_thinking:
@@ -1052,12 +1436,17 @@ class ChessGame:
                 self.board.pop()
                 if self.san_history:
                     self.san_history.pop()
-                if self.grades:
-                    g = self.grades.pop()
-                    self.coach_score -= g.points
-                    if g.points > 0 and self.coach_streak > 0:
-                        self.coach_streak -= 1
-            self.last_grade = self.grades[-1] if self.grades else None
+        # drop grades attached to undone positions (AI moves were never graded)
+        kept: list[tuple[int, coach.Grade]] = []
+        for ply, g in self.grades:
+            if ply <= len(self.board.move_stack):
+                kept.append((ply, g))
+            else:
+                self.coach_score -= g.points
+                if g.points > 0 and self.coach_streak > 0:
+                    self.coach_streak -= 1
+        self.grades = kept
+        self.last_grade = self.grades[-1][1] if self.grades else None
         self.last_move = self.board.peek() if self.board.move_stack else None
         self.selected = None
         self.legal_for_selected = []
@@ -1084,20 +1473,74 @@ class ChessGame:
         self.last_grade = None
         self.toast = None
         self.best_arrow = None
+        self.game_ai = None
+        self.game_rated = False
+        self._grade_meta.clear()
+        self._prev_grade = None
+        self._prev_loss = None
+        self._pos_shown_at = time.time()
         self._refresh_check_state()
         self.sound.move()
 
-    # -- AI (Stockfish game opponent, selectable strength) ------------------
+    def _maybe_rate_game(self) -> None:
+        """Once per rated game: blend result + move quality into game Elo."""
+        if (not self.game_over_text or self.game_rated or self.game_ai is None
+                or self.mode not in ("AI_BLACK", "AI_WHITE")
+                or self.puzzle_mode or self.spar_mode):
+            return
+        self.game_rated = True
+        user_white = self.mode == "AI_BLACK"
+        if self.board.is_checkmate():
+            winner_white = self.board.turn == chess.BLACK
+            result = 1.0 if winner_white == user_white else 0.0
+        else:
+            result = 0.5
+        losses = [g.cp_loss for _, g in self.grades]
+        avg_loss = sum(losses) / len(losses) if losses else -1.0
+        calib = profile_mod.calibration_game(self.profile)
+        gr_before = self.profile.get("game_rating", profile_mod.GAME_START)
+        out = profile_mod.rate_game(self.profile, self.game_ai["rating"], result, avg_loss)
+        self.game_over_sub += f" · Elo {out['rating']} ({out['delta']:+d}) vs {self.game_ai['name']}"
+        profile_mod.log_attempt({
+            "v": 1, "kind": "game_result", "subject": self.subject_id,
+            "session": self.session_id, "mode": "game", "calibration": calib,
+            "game_id": self._game_id, "ai_name": self.game_ai.get("name"),
+            "ai_rating": self.game_ai.get("rating"), "tier": "game",
+            "solved": result == 1.0, "terminal": True,
+            "result": result, "avg_loss": round(avg_loss, 1) if avg_loss >= 0 else None,
+            "moves": len(self.board.move_stack),
+            "ms_total": int((time.time() - self._game_start_at) * 1000),
+            "pr_before": gr_before, "pr_after": out["rating"], "pr_delta": out["delta"],
+        })
+
+    # -- AI (adaptive ladder by default, manual override via G) ------------
+    def matched_rung(self) -> dict:
+        return profile_mod.match_ai(self.profile.get("game_rating", profile_mod.GAME_START))
+
+    def ai_label(self) -> str:
+        if self.ai_level == "auto":
+            r = self.matched_rung()
+            return f"Auto {r['rating']}"
+        lvl = coach.EngineManager.AI_LEVELS.get(self.ai_level)
+        return lvl["label"] if lvl else self.ai_level
+
     def maybe_start_ai(self) -> None:
         if not self.is_ai_turn() or self.ai_thinking:
             return
         self.ai_thinking = True
         snapshot = self.board.copy()
         level = self.ai_level
+        if level == "auto":
+            rung_rating = (self.game_ai or self.matched_rung())["rating"]
+        else:
+            rung_rating = 0
 
         def worker() -> None:
             try:
-                mv = self.coach.choose_move(snapshot, level)
+                if level == "auto":
+                    mv = self.coach.choose_move_rated(snapshot, rung_rating)
+                else:
+                    mv = self.coach.choose_move(snapshot, level)
             except Exception:
                 mv = None
             self.ai_move = mv
@@ -1108,7 +1551,7 @@ class ChessGame:
         self.ai_thread.start()
 
     def cycle_ai_level(self) -> None:
-        order = ["easy", "medium", "hard"]
+        order = ["auto", "easy", "medium", "hard"]
         self.ai_level = order[(order.index(self.ai_level) + 1) % len(order)]
         self.sound.move()
 
@@ -1123,21 +1566,203 @@ class ChessGame:
 
     # -- drawing --------------------------------------------------------
     def draw(self) -> None:
+        if self.screen_state == "study":
+            self.study_screen.draw()
+            return
         self.screen.fill(BG)
-        # subtle background gradient circles
         self._draw_bg_glow()
-        self._draw_board()
-        self._draw_best_arrow()
-        self._draw_pieces_and_anims()
-        self._draw_panel()
-        self._draw_toast()
-        if self.promotion_choices:
-            self._draw_promotion_dialog()
-        if self.game_over_text:
-            self._draw_game_over()
-        if self.ai_thinking:
-            self._draw_thinking()
+        if self.screen_state == "home":
+            self._draw_home()
+        elif self.screen_state == "tiers":
+            self._draw_tiers()
+        elif self.screen_state == "profile":
+            self._draw_profile()
+        else:
+            self._draw_board()
+            self._draw_best_arrow()
+            self._draw_pieces_and_anims()
+            self._draw_panel()
+            self._draw_toast()
+            if self.puzzle_mode and self.puzzle_status == "solving":
+                self._draw_clock()
+            if self.promotion_choices:
+                self._draw_promotion_dialog()
+            if self.game_over_text:
+                self._draw_game_over()
+            if self.ai_thinking:
+                self._draw_thinking()
         pygame.display.flip()
+
+    # -- screens: home / tiers / profile ----------------------------------
+    def _screen_title(self, text: str, y: int = 90) -> None:
+        t = pygame.font.SysFont("helveticaneue", 64, bold=True).render(text, True, TEXT)
+        self.screen.blit(t, ((WIN_W - t.get_width()) / 2, y))
+
+    def _draw_home(self) -> None:
+        self._screen_title("Chesso")
+        sub = self.font_ui.render("play chess · practice puzzles · take part in a study",
+                                  True, MUTED)
+        self.screen.blit(sub, ((WIN_W - sub.get_width()) / 2, 170))
+        rung = self.matched_rung()
+        tiles = [
+            ("play", "Play (1)",
+             f"Elo {self.profile.get('game_rating', 400)} · next: {rung['name']} {rung['rating']}",
+             "Rated vs adaptive AI"),
+            ("puzzles", "Puzzles (2)",
+             f"Elo {self.puzzle_rating} · 60-120s clocks",
+             "Easy / Medium / Hard tiers"),
+            ("profile", "Profile (3)",
+             f"{self.profile.get('puzzles_solved', 0)} solves · {self.profile.get('game_games', 0)} games",
+             "Ratings, stats & data"),
+        ]
+        self.home_tiles = []
+        tw, th, gap = 280, 190, 28
+        x0 = (WIN_W - (3 * tw + 2 * gap)) / 2
+        y0 = 250
+        mx, my = pygame.mouse.get_pos()
+        for i, (key, title, l1, l2) in enumerate(tiles):
+            r = pygame.Rect(x0 + i * (tw + gap), y0, tw, th)
+            hov = r.collidepoint(mx, my)
+            pygame.draw.rect(self.screen, (52, 56, 86) if hov else (36, 38, 60), r, border_radius=16)
+            pygame.draw.rect(self.screen, ACCENT if hov else (70, 72, 100), r, 2, border_radius=16)
+            t1 = self.font_title.render(title, True, TEXT)
+            self.screen.blit(t1, (r.x + (tw - t1.get_width()) / 2, r.y + 28))
+            for j, ln in enumerate((l1, l2)):
+                s = self.font_ui.render(ln, True, MUTED if j else TEXT)
+                self.screen.blit(s, (r.x + (tw - s.get_width()) / 2, r.y + 84 + j * 30))
+            self.home_tiles.append((r, key))
+        how = [
+            "How it works: every human move is graded (Best +10 … Blunder −15).",
+            "Play: your rating moves with results AND move quality vs adaptive AI.",
+            "Puzzles: beat the clock — first-try Best +10%, decent try +3, timeout fails.",
+        ]
+        for j, ln in enumerate(how):
+            s = self.font_small.render(ln, True, MUTED)
+            self.screen.blit(s, ((WIN_W - s.get_width()) / 2, 480 + j * 24))
+        study_rect = pygame.Rect((WIN_W-560)//2, 578, 560, 58)
+        pygame.draw.rect(self.screen, (38, 58, 84), study_rect, border_radius=12)
+        pygame.draw.rect(self.screen, ACCENT, study_rect, 1, border_radius=12)
+        study_text = self.font_ui_b.render("Research study (4) · choices, hints & independent learning", True, TEXT)
+        self.screen.blit(study_text, study_text.get_rect(center=study_rect.center))
+        self.home_tiles.append((study_rect, "study"))
+        hint = self.font_ui.render("1 play · 2 puzzles · 3 profile · 4 research study", True, MUTED)
+        self.screen.blit(hint, ((WIN_W - hint.get_width()) / 2, WIN_H - 90))
+
+    def _draw_tiers(self) -> None:
+        self._screen_title("Puzzles", 60)
+        sub = self.font_ui.render(f"your puzzle rating {self.puzzle_rating} — pick a tier",
+                                  True, MUTED)
+        self.screen.blit(sub, ((WIN_W - sub.get_width()) / 2, 140))
+        counts: dict[str, int] = {"easy": 0, "medium": 0, "hard": 0}
+        for p in self.puzzle_pool:
+            counts[profile_mod.tier_of(int(p.get("rating", 1200)))] += 1
+        descs = {
+            "easy": ("Easy", "<1000 · 60s · 10 pts"),
+            "medium": ("Medium", "1000–1400 · 90s · 20 pts"),
+            "hard": ("Hard", ">1400 · 120s · 30 pts"),
+        }
+        self.tier_cards = []
+        tw, th, gap = 280, 190, 28
+        x0 = (WIN_W - (3 * tw + 2 * gap)) / 2
+        y0 = 210
+        mx, my = pygame.mouse.get_pos()
+        for i, tier in enumerate(("easy", "medium", "hard")):
+            r = pygame.Rect(x0 + i * (tw + gap), y0, tw, th)
+            hov = r.collidepoint(mx, my)
+            pygame.draw.rect(self.screen, (52, 56, 86) if hov else (36, 38, 60), r, border_radius=16)
+            pygame.draw.rect(self.screen, ACCENT if hov else (70, 72, 100), r, 2, border_radius=16)
+            title, info = descs[tier]
+            dot_col = {"easy": GREEN, "medium": YELLOW, "hard": RED}[tier]
+            t1 = self.font_title.render(title, True, TEXT)
+            row_w = 14 + 10 + t1.get_width()
+            dx0 = r.x + (tw - row_w) / 2
+            pygame.draw.circle(self.screen, dot_col, (int(dx0 + 7), int(r.y + 28 + 18)), 9)
+            self.screen.blit(t1, (dx0 + 14 + 10, r.y + 28))
+            s1 = self.font_ui.render(info, True, TEXT)
+            self.screen.blit(s1, (r.x + (tw - s1.get_width()) / 2, r.y + 84))
+            s2 = self.font_ui.render(f"{counts[tier]} puzzles", True, MUTED)
+            self.screen.blit(s2, (r.x + (tw - s2.get_width()) / 2, r.y + 118))
+            self.tier_cards.append((r, tier))
+        self.back_button = pygame.Rect((WIN_W - 200) / 2, 450, 200, 44)
+        hov = self.back_button.collidepoint(mx, my)
+        pygame.draw.rect(self.screen, (46, 48, 70) if not hov else (60, 63, 90),
+                         self.back_button, border_radius=10)
+        t = self.font_ui.render("< Home (Esc)", True, TEXT)
+        self.screen.blit(t, (self.back_button.x + (200 - t.get_width()) / 2,
+                             self.back_button.y + 10))
+
+    def _draw_profile(self) -> None:
+        self._screen_title("Profile", 50)
+        p = self.profile
+        lines = [
+            f"Subject  {self.subject_id}   (anonymous, local only)",
+            f"Game rating  {p.get('game_rating', 400)}  over {p.get('game_games', 0)} rated games",
+            f"Puzzle rating  {p.get('puzzle_rating', 800)}  ·  "
+            f"{p.get('puzzles_solved', 0)}/{p.get('puzzles_attempted', 0)} solved",
+            "Tier solves  " + "  ".join(
+                f"{t}: {p.get('tier_solves', {}).get(t, 0)}"
+                for t in ("easy", "medium", "hard")),
+            f"Points  {p.get('points_total', 0)}   ·   best streak {p.get('best_streak', 0)}",
+        ]
+        try:
+            import os as _os
+            nrows = sum(1 for _ in open(profile_mod.ATTEMPTS_FILE)) \
+                if _os.path.exists(profile_mod.ATTEMPTS_FILE) else 0
+        except Exception:
+            nrows = 0
+        lines.append(f"Research rows logged  {nrows}  (data/attempts.jsonl, schema v1)")
+        y = 150
+        for ln in lines:
+            s = self.font_ui.render(ln, True, TEXT)
+            self.screen.blit(s, ((WIN_W - s.get_width()) / 2, y))
+            y += 36
+        y += 8
+        hdr = self.font_small.render("RECENT", True, MUTED)
+        self.screen.blit(hdr, ((WIN_W - hdr.get_width()) / 2, y))
+        y += 26
+        for h in p.get("history", [])[-8:]:
+            if h.get("kind") == "game":
+                res = {1.0: "win", 0.5: "draw", 0.0: "loss"}.get(h.get("result"), "?")
+                txt = f"game vs {h.get('ai')} · {res} · {h.get('delta', 0):+d} to {h.get('rating')}"
+            else:
+                txt = (f"puzzle {h.get('puzzle')} ({h.get('tier') or '?'}) · "
+                       f"{'solved' if h.get('solved') else 'missed'} · "
+                       f"{h.get('delta', 0):+d} to {h.get('rating')}")
+            s = self.font_small.render(txt, True, MUTED)
+            self.screen.blit(s, ((WIN_W - s.get_width()) / 2, y))
+            y += 24
+        self.back_button = pygame.Rect((WIN_W - 200) / 2, WIN_H - 100, 200, 44)
+        mx, my = pygame.mouse.get_pos()
+        hov = self.back_button.collidepoint(mx, my)
+        pygame.draw.rect(self.screen, (46, 48, 70) if not hov else (60, 63, 90),
+                         self.back_button, border_radius=10)
+        t = self.font_ui.render("< Home (Esc)", True, TEXT)
+        self.screen.blit(t, (self.back_button.x + (200 - t.get_width()) / 2,
+                             self.back_button.y + 10))
+
+    def _draw_clock(self) -> None:
+        # Thin bar in the margin ABOVE the board (it used to hang half-clipped
+        # off the bottom of the window).
+        frac = max(0.0, (self.puzzle_deadline - time.time())
+                   / max(1, profile_mod.TIERS[self.puzzle_tier]["time"]))
+        w = BOARD_PX
+        x = BOARD_X
+        y = BOARD_Y - 30  # clear of the board's outer border (starts at BOARD_Y-12)
+        pygame.draw.rect(self.screen, (22, 23, 36), (x, y, w, 14), border_radius=7)
+        col = GREEN if frac > 0.5 else (YELLOW if frac > 0.25 else RED)
+        pygame.draw.rect(self.screen, col, (x, y, max(2, w * frac), 14), border_radius=7)
+
+    def _material_words(self) -> str:
+        _, _, mat = self.captured_and_material()
+        if mat == 0:
+            base = "Even material"
+        else:
+            side = "White" if mat > 0 else "Black"
+            base = f"{side} +{abs(mat) / 100:g}"
+        if self.last_grade:
+            g = self.last_grade
+            return f"{base} · last: {g.label} {g.played_san}"
+        return base
 
     def _draw_best_arrow(self) -> None:
         if not self.best_arrow:
@@ -1206,13 +1831,13 @@ class ChessGame:
         self.screen.blit(glow, (0, 0))
 
     def _draw_board(self) -> None:
-        # drop shadow + rounded border
+        # drop shadow + rounded frame
         outer = pygame.Rect(BOARD_X - 12, BOARD_Y - 12, BOARD_PX + 24, BOARD_PX + 24)
-        shadow = pygame.Surface((outer.w + 20, outer.h + 20), pygame.SRCALPHA)
-        pygame.draw.rect(shadow, (0, 0, 0, 110), shadow.get_rect(), border_radius=18)
-        self.screen.blit(shadow, (outer.x - 10, outer.y - 6))
-        pygame.draw.rect(self.screen, (42, 44, 66), outer, border_radius=14)
-        pygame.draw.rect(self.screen, (70, 72, 100), outer, 2, border_radius=14)
+        shadow = pygame.Surface((outer.w + 24, outer.h + 24), pygame.SRCALPHA)
+        pygame.draw.rect(shadow, (0, 0, 0, 100), shadow.get_rect(), border_radius=18)
+        self.screen.blit(shadow, (outer.x - 12, outer.y - 10))
+        pygame.draw.rect(self.screen, (40, 42, 63), outer, border_radius=14)
+        pygame.draw.rect(self.screen, (66, 68, 96), outer, 1, border_radius=14)
 
         sq = self.sq_size
         t = time.time()
@@ -1232,19 +1857,18 @@ class ChessGame:
                     base = LIGHT_SQ_HOVER if light else DARK_SQ_HOVER
                 pygame.draw.rect(self.screen, base, (x, y, sq + 1, sq + 1))
 
-                # last-move highlight
+                # last-move highlight (soft warm tint)
                 if self.last_move and real in (self.last_move.from_square, self.last_move.to_square):
                     hl = pygame.Surface((sq, sq), pygame.SRCALPHA)
-                    hl.fill((255, 235, 120, 90))
+                    hl.fill((LAST_MOVE_HL[0], LAST_MOVE_HL[1], LAST_MOVE_HL[2], 80))
                     self.screen.blit(hl, (x, y))
 
-                # selected highlight (pulsing)
+                # selected highlight (soft, steady — no harsh pulse)
                 if real == self.selected:
-                    pulse = int(70 + 30 * math.sin(t * 6))
                     hl = pygame.Surface((sq, sq), pygame.SRCALPHA)
-                    hl.fill((110, 200, 130, pulse + 60))
+                    hl.fill((110, 200, 130, 90))
                     self.screen.blit(hl, (x, y))
-                    pygame.draw.rect(self.screen, (90, 220, 140), (x + 2, y + 2, sq - 4, sq - 4), 3, border_radius=6)
+                    pygame.draw.rect(self.screen, (105, 210, 140), (x + 2, y + 2, sq - 4, sq - 4), 2, border_radius=8)
 
                 # check highlight (red radial pulse)
                 if real == self.king_in_check_sq:
@@ -1255,17 +1879,17 @@ class ChessGame:
                     pygame.draw.circle(glow, (255, 120, 120, 200), (sq / 2, sq / 2), sq * 0.22)
                     self.screen.blit(glow, (x, y))
 
-                # coordinates on a-file / 1st rank edges
+                # coordinates on a-file / 1st rank edges (high-contrast, subtle)
                 if file_i == 0:
                     label = str(r + 1)
-                    col = DARK_SQ if light else LIGHT_SQ
+                    col = (150, 110, 75) if light else (237, 214, 179)
                     txt = self.font_small.render(label, True, col)
-                    self.screen.blit(txt, (x + 5, y + 4))
+                    self.screen.blit(txt, (x + 6, y + 5))
                 if rank_i == 7:
                     label = chr(ord("a") + f)
-                    col = DARK_SQ if light else LIGHT_SQ
+                    col = (150, 110, 75) if light else (237, 214, 179)
                     txt = self.font_small.render(label, True, col)
-                    self.screen.blit(txt, (x + sq - 16, y + sq - 20))
+                    self.screen.blit(txt, (x + sq - 17, y + sq - 21))
 
         # legal move dots / rings
         for m in self.legal_for_selected:
@@ -1400,19 +2024,28 @@ class ChessGame:
         pygame.draw.rect(self.screen, PANEL_BG, panel, border_radius=14)
         pygame.draw.rect(self.screen, (62, 64, 92), panel, 1, border_radius=14)
 
-        # title
-        title = self.font_title.render("♞ Chesso", True, TEXT)
+        # title (plain text — chess glyphs/emoji lack coverage in UI fonts)
+        title = self.font_title.render("Chesso", True, TEXT)
         self.screen.blit(title, (PANEL_X + 18, BOARD_Y + 4))
         sub = self.font_small.render("pygame · python-chess", True, MUTED)
         self.screen.blit(sub, (PANEL_X + 20, BOARD_Y + 38))
+        self.home_button = pygame.Rect(PANEL_X + PANEL_W - 92, BOARD_Y + 4, 76, 30)
+        mx0, my0 = pygame.mouse.get_pos()
+        hov0 = self.home_button.collidepoint(mx0, my0)
+        pygame.draw.rect(self.screen, (60, 63, 90) if hov0 else (46, 48, 70),
+                         self.home_button, border_radius=8)
+        ht = self.font_small.render("Home", True, TEXT)
+        self.screen.blit(ht, (self.home_button.x + (76 - ht.get_width()) / 2,
+                              self.home_button.y + 7))
 
         # turn banner
         white_to_move = self.board.turn == chess.WHITE
         banner = pygame.Rect(PANEL_X + 14, BOARD_Y + 62, PANEL_W - 28, 52)
-        pygame.draw.rect(self.screen, (38, 40, 58), banner, border_radius=10)
-        dot_c = (245, 245, 245) if white_to_move else (15, 15, 20)
-        pygame.draw.circle(self.screen, dot_c, (banner.x + 26, banner.y + 26), 13)
-        pygame.draw.circle(self.screen, (120, 120, 140), (banner.x + 26, banner.y + 26), 13, 2)
+        pygame.draw.rect(self.screen, (44, 46, 66), banner, border_radius=10)
+        dot_c = (242, 242, 246) if white_to_move else (22, 22, 30)
+        ring_c = (130, 132, 150) if white_to_move else (170, 172, 190)
+        pygame.draw.circle(self.screen, dot_c, (banner.x + 26, banner.y + 26), 12)
+        pygame.draw.circle(self.screen, ring_c, (banner.x + 26, banner.y + 26), 12, 2)
         if self.game_over_text:
             line1, col = self.game_over_text, YELLOW
         elif self.board.is_check():
@@ -1424,9 +2057,13 @@ class ChessGame:
         mode_label = {"2P": "2 players · local", "AI_BLACK": "You: White · AI: Black",
                       "AI_WHITE": "You: Black · AI: White"}[self.mode]
         if self.mode != "2P":
-            mode_label += f" · {coach.EngineManager.AI_LEVELS[self.ai_level]['label']}"
-        if self.spar_mode:
-            mode_label = f"Spar · ★{self.puzzle_rating}"
+            mode_label += f" · {self.ai_label()}"
+        if self.spar_mode and self.puzzle:
+            themes = " ".join((self.puzzle.get("themes") or ["spar"])[:2])
+            mode_label = (f"Spar {themes} · {self.spar_moves}/{self.spar_target}")
+        elif self.puzzle_mode and self.puzzle:
+            themes = " ".join((self.puzzle.get("themes") or ["puzzle"])[:2])
+            mode_label = (f"Puzzle {themes} · Elo {self.puzzle.get('rating', '?')}")
         extra = ""
         if self.ai_thinking:
             extra = " · AI thinking…"
@@ -1445,24 +2082,23 @@ class ChessGame:
         mx, my = pygame.mouse.get_pos()
         hov = ab.collidepoint(mx, my)
         pygame.draw.rect(self.screen, (52, 90, 150) if hov else (46, 78, 132), ab, border_radius=9)
-        label = {  # next mode hint
-            "2P": "🤖 vs AI (A)",
-            "AI_BLACK": "👥 2P (A)",
-            "AI_WHITE": "🤖 AI:W (A)",
+        label = {  # current mode; (A) cycles
+            "2P": "2P local (A)",
+            "AI_BLACK": "You W · AI B (A)",
+            "AI_WHITE": "You B · AI W (A)",
         }[self.mode]
         # cycle 2P -> AI_BLACK -> AI_WHITE -> 2P
         tx = self.font_ui.render(label, True, (235, 242, 255))
         self.screen.blit(tx, (ab.x + 14, ab.y + 8))
         hov2 = lb.collidepoint(mx, my)
         pygame.draw.rect(self.screen, (52, 90, 150) if hov2 else (46, 78, 132), lb, border_radius=9)
-        lv = coach.EngineManager.AI_LEVELS[self.ai_level]
-        tx2 = self.font_ui.render(f"{lv['label']} (G)", True, (235, 242, 255))
+        tx2 = self.font_ui.render(f"{self.ai_label()} (G)", True, (235, 242, 255))
         self.screen.blit(tx2, (lb.x + (lb.w - tx2.get_width()) / 2, lb.y + 8))
 
         # captured pieces
         wcaps, bcaps, mat = self.captured_and_material()
         cy = BOARD_Y + 172
-        self.screen.blit(self.font_small.render("CAPTURED", True, MUTED), (PANEL_X + 16, cy))
+        self.screen.blit(self.font_small.render("Captured", True, MUTED), (PANEL_X + 16, cy))
         adv = ""
         if mat > 0:
             adv = f"White +{mat / 100:g}"
@@ -1473,11 +2109,14 @@ class ChessGame:
             self.screen.blit(at, (PANEL_X + PANEL_W - 16 - at.get_width(), cy))
         self._draw_captured_row(wcaps, chess.BLACK, PANEL_X + 16, cy + 20)
         self._draw_captured_row(bcaps, chess.WHITE, PANEL_X + 16, cy + 46)
+        # plain-words verdict for beginners (material + last graded move)
+        vw = self.font_small.render(self._material_words()[:52], True, ACCENT)
+        self.screen.blit(vw, (PANEL_X + 16, cy + 70))
 
         # move list
-        ly = cy + 78
-        self.screen.blit(self.font_small.render("MOVES  (scroll with wheel)", True, MUTED), (PANEL_X + 16, ly))
-        list_rect = pygame.Rect(PANEL_X + 14, ly + 20, PANEL_W - 28, 170)
+        ly = cy + 92
+        self.screen.blit(self.font_small.render("Moves  ·  scroll with wheel", True, MUTED), (PANEL_X + 16, ly))
+        list_rect = pygame.Rect(PANEL_X + 14, ly + 20, PANEL_W - 28, 156)
         pygame.draw.rect(self.screen, (22, 23, 36), list_rect, border_radius=10)
         # clip
         self.screen.set_clip(list_rect)
@@ -1501,7 +2140,7 @@ class ChessGame:
             self.screen.blit(wm, (list_rect.x + 52, row_y))
             self.screen.blit(bm, (list_rect.x + 150, row_y))
         if not self.san_history:
-            hint = self.font_moves.render("1. e4 …", True, (90, 92, 115))
+            hint = self.font_small.render("-- no moves yet --", True, (90, 92, 115))
             self.screen.blit(hint, (list_rect.x + 12, y0))
         self.screen.set_clip(None)
 
@@ -1511,19 +2150,20 @@ class ChessGame:
         pygame.draw.rect(self.screen, (22, 23, 36), co_rect, border_radius=10)
         pygame.draw.rect(self.screen, (62, 64, 92), co_rect, 1, border_radius=10)
         backend = self.coach.backend if hasattr(self, "coach") else "local"
-        head = f"COACH · {backend} · Score {self.coach_score} · 🔥{self.coach_streak}"
+        head = f"COACH · {backend} · Score {self.coach_score} · Streak {self.coach_streak}"
         if self.puzzle_mode and self.puzzle:
             themes = " ".join((self.puzzle.get("themes") or ["tactic"])[:2])
             sol = self.puzzle.get("solution") or []
             total = (len(sol) + 1) // 2
             done = min(total, (self.puzzle_ply + 1) // 2)
-            head = (f"{themes} · ★{self.puzzle.get('rating', '?')} "
-                    f"· you ★{self.puzzle_rating} · {done}/{total} "
-                    f"· {self.puzzle_status}")
+            secs = max(0, int(self.puzzle_deadline - time.time()))
+            head = (f"{themes} · {self.puzzle.get('rating', '?')} "
+                    f"· you {self.puzzle_rating} · {done}/{total} "
+                    f"· {secs}s · {self.puzzle_status}")
         elif self.spar_mode and self.puzzle:
             themes = " ".join((self.puzzle.get("themes") or ["tactic"])[:2])
-            head = (f"SPAR {themes} · ★{self.puzzle.get('rating', '?')} "
-                    f"· you ★{self.puzzle_rating} · "
+            head = (f"SPAR {themes} · {self.puzzle.get('rating', '?')} "
+                    f"· you {self.puzzle_rating} · "
                     f"{min(self.spar_moves, self.spar_target)}/{self.spar_target} "
                     f"· {self.puzzle_status}")
         self.screen.blit(self.font_small.render(head, True, MUTED),
@@ -1552,12 +2192,12 @@ class ChessGame:
         self.puzzle_button = pygame.Rect(co_rect.x + 12 + bw * 2, co_rect.y + 68, bw, 30)
         self.spar_button = pygame.Rect(co_rect.x + 15 + bw * 3, co_rect.y + 68, bw, 30)
         for rect, lab in (
-            (self.coach_button, f"{'On' if self.coach_enabled else 'Off'}(C)"),
-            (self.hint_button, "Hint(H)"),
+            (self.coach_button, f"{'On' if self.coach_enabled else 'Off'} (C)"),
+            (self.hint_button, "Hint (H)"),
             (self.puzzle_button,
-             "Next▸" if self.puzzle_mode else "Puzz(P)"),
+             "Next" if self.puzzle_mode else "Puzz (P)"),
             (self.spar_button,
-             "Next▸" if self.spar_mode else "Spar(S)"),
+             "Next" if self.spar_mode else "Spar (S)"),
         ):
             hov = rect.collidepoint(mx, my)
             pygame.draw.rect(self.screen, (60, 63, 90) if hov else (46, 48, 70),
@@ -1568,26 +2208,32 @@ class ChessGame:
         # buttons
         for b in self.buttons:
             if b.action == "sound":
-                b.label = f"♪ Sound: {'On' if self.sound.enabled else 'Off'}"
+                b.label = f"Sound: {'On' if self.sound.enabled else 'Off'}"
             hov = b.rect.collidepoint(mx, my)
             col = (60, 63, 90) if hov else (46, 48, 70)
             pygame.draw.rect(self.screen, col, b.rect, border_radius=9)
             pygame.draw.rect(self.screen, (80, 83, 115), b.rect, 1, border_radius=9)
             tx = self.font_ui.render(b.label, True, TEXT)
-            self.screen.blit(tx, (b.rect.x + (b.rect.w - tx.get_width()) / 2, b.rect.y + 9))
+            self.screen.blit(tx, (b.rect.x + (b.rect.w - tx.get_width()) / 2, b.rect.y + 8))
 
-        # footer hint
-        hint = self.font_small.render("N new/next · U undo · A AI · G level · P puzz · S spar · D daily", True, MUTED)
-        self.screen.blit(hint, (PANEL_X + 14, WIN_H - 78))
+        # footer hint — sits in the padding below the buttons, never over them
+        footer_y = BOARD_Y + BOARD_PX + 8 - 20
+        hint = self.font_small.render("N new  ·  U undo  ·  A mode  ·  G level  ·  D daily", True, MUTED)
+        self.screen.blit(hint, (PANEL_X + 16, footer_y))
 
     def _draw_captured_row(self, pieces: list[int], color: bool, x: int, y: int) -> None:
+        # Each captured glyph sits on a contrasting chip so both colors read
+        # on the dark panel (dark glyphs were invisible blobs before).
         cx = x
         for pt in pieces:
+            chip_bg = (226, 214, 186) if color == chess.BLACK else (44, 46, 66)
+            chip_fg = (24, 24, 30) if color == chess.BLACK else (232, 232, 238)
+            chip = pygame.Rect(cx - 2, y - 6, 24, 24)
+            pygame.draw.rect(self.screen, chip_bg, chip, border_radius=6)
             g = GLYPH[(pt, color)]
-            fill = (240, 240, 245) if color == chess.WHITE else (20, 20, 26)
-            txt = self.font_glyph_small.render(g, True, fill)
-            self.screen.blit(txt, (cx, y - 4))
-            cx += 22
+            txt = self.font_glyph_small.render(g, True, chip_fg)
+            self.screen.blit(txt, (cx + (22 - txt.get_width()) / 2, y - 5))
+            cx += 26
 
     def _draw_promotion_dialog(self) -> None:
         overlay = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
@@ -1601,7 +2247,7 @@ class ChessGame:
         by = min(max(cy - box_h / 2, BOARD_Y), BOARD_Y + BOARD_PX - box_h)
         box = pygame.Rect(bx, by, box_w, box_h)
         pygame.draw.rect(self.screen, (36, 38, 58), box, border_radius=12)
-        pygame.draw.rect(self.screen, ACCENT, box, 2, border_radius=12)
+        pygame.draw.rect(self.screen, (90, 92, 120), box, 1, border_radius=12)
         ttl = self.font_ui_b.render("Promote to:", True, TEXT)
         self.screen.blit(ttl, (bx + 14, by + 8))
         order = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
@@ -1622,31 +2268,86 @@ class ChessGame:
             self.promo_rects.append((r, mv))
 
     def _draw_game_over(self) -> None:
-        target = 170
+        target = 200
         self.game_over_alpha = min(target, self.game_over_alpha + 3.5)
-        overlay = pygame.Surface((BOARD_PX, 120), pygame.SRCALPHA)
-        overlay.fill((12, 12, 22, int(self.game_over_alpha)))
-        bx, by = BOARD_X, BOARD_Y + BOARD_PX // 2 - 60
-        self.screen.blit(overlay, (bx, by))
-        pygame.draw.rect(self.screen, YELLOW, (bx, by, BOARD_PX, 120), 2, border_radius=10)
-        t1 = self.font_title.render(self.game_over_text, True, (255, 255, 255))
-        t2 = self.font_ui.render(self.game_over_sub, True, MUTED)
-        self.screen.blit(t1, (bx + (BOARD_PX - t1.get_width()) / 2, by + 22))
-        self.screen.blit(t2, (bx + (BOARD_PX - t2.get_width()) / 2, by + 62))
+        bw, bh = 460, 116
+        bx = BOARD_X + (BOARD_PX - bw) / 2
+        by = BOARD_Y + BOARD_PX // 2 - bh / 2
+        card = pygame.Surface((bw, bh), pygame.SRCALPHA)
+        pygame.draw.rect(card, (16, 17, 28, int(self.game_over_alpha)),
+                         card.get_rect(), border_radius=14)
+        self.screen.blit(card, (bx, by))
+        pygame.draw.rect(self.screen, (90, 92, 120), (bx, by, bw, bh), 1, border_radius=14)
+        t1 = self.font_ui_b.render(self.game_over_text, True, (255, 255, 255))
+        t2 = self.font_small.render(self.game_over_sub, True, MUTED)
+        self.screen.blit(t1, (bx + (bw - t1.get_width()) / 2, by + 28))
+        self.screen.blit(t2, (bx + (bw - t2.get_width()) / 2, by + 60))
 
     def _draw_thinking(self) -> None:
+        # Banner subtitle already shows thinking state; draw a small pill
+        # on the board so it never overlaps panel text.
         dots = int(time.time() * 4) % 4
-        txt = self.font_ui.render("AI thinking" + "." * dots, True, ACCENT)
-        self.screen.blit(txt, (PANEL_X + 16, BOARD_Y + 122 + 40))
+        txt = self.font_small.render("AI thinking" + "." * dots, True, (235, 242, 255))
+        pad_x, pad_y = 12, 7
+        pill = pygame.Surface((txt.get_width() + pad_x * 2, txt.get_height() + pad_y * 2),
+                              pygame.SRCALPHA)
+        pygame.draw.rect(pill, (46, 78, 132, 235), pill.get_rect(), border_radius=9)
+        pill.blit(txt, (pad_x, pad_y))
+        self.screen.blit(pill, (BOARD_X + 16, BOARD_Y + 16))
 
     # -- events ---------------------------------------------------------
+    def _go_home_tile(self, key: str) -> None:
+        self.sound.move()
+        if key == "play":
+            self.screen_state = "play"  # resume the board as-is
+        elif key == "puzzles":
+            self.screen_state = "tiers"
+        elif key == "profile":
+            self.screen_state = "profile"
+        elif key == "study":
+            from study_ui import StudyScreen
+
+            self.study_screen = StudyScreen(self, self.study_options)
+            self.screen_state = "study"
+
     def cycle_mode(self) -> None:
         order = ["2P", "AI_BLACK", "AI_WHITE"]
         self.mode = order[(order.index(self.mode) + 1) % len(order)]
+        # drop any in-flight AI thought: it belongs to the old mode and must
+        # never land a surprise move (this was the "AI never moves" ghost —
+        # a stale thought could also sit forever on the wrong side).
+        self.ai_thinking = False
+        self.ai_thread = None
+        self.ai_move = None
         self.sound.move()
 
     def handle_click(self, pos: tuple[int, int], button: int) -> None:
         x, y = pos
+        if self.screen_state == "home":
+            for rect, key in self.home_tiles:
+                if rect.collidepoint(x, y):
+                    self._go_home_tile(key)
+                    return
+            return
+        if self.screen_state == "tiers":
+            for rect, tier in self.tier_cards:
+                if rect.collidepoint(x, y):
+                    self.enter_tier(tier)
+                    self.sound.move()
+                    return
+            if self.back_button.collidepoint(x, y):
+                self.screen_state = "home"
+                self.sound.move()
+            return
+        if self.screen_state == "profile":
+            if self.back_button.collidepoint(x, y):
+                self.screen_state = "home"
+                self.sound.move()
+            return
+        if self.home_button.collidepoint(x, y):
+            self.screen_state = "home"
+            self.sound.move()
+            return
         if self.promotion_choices and hasattr(self, "promo_rects"):
             for rect, mv in self.promo_rects:
                 if rect.collidepoint(x, y):
@@ -1672,9 +2373,9 @@ class ChessGame:
                 self._next_puzzle()
             elif self.spar_mode:
                 self.exit_spar()
-                self.enter_puzzle()
+                self.screen_state = "tiers"
             else:
-                self.enter_puzzle()
+                self.screen_state = "tiers"
             self.sound.move()
             return
         if self.spar_button.collidepoint(x, y):
@@ -1729,6 +2430,13 @@ class ChessGame:
         while running:
             dt = self.clock.tick(60) / 1000.0
             for event in pygame.event.get():
+                if self.screen_state == "study":
+                    if event.type == pygame.QUIT:
+                        self.study_screen.leave()
+                        running = False
+                    elif self.study_screen.handle_event(event):
+                        self.screen_state = "home"
+                    continue
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.MOUSEMOTION:
@@ -1737,9 +2445,10 @@ class ChessGame:
                         self.drag_pos = event.pos
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:
-                        # maybe start drag
+                        # maybe start drag (board screens only)
                         sq = self.pixel_to_square(*event.pos)
-                        if (sq is not None and not self.promotion_choices
+                        if (self.screen_state in ("play", "puzzle")
+                                and sq is not None and not self.promotion_choices
                                 and self.human_can_move() and not self._ai_blocks_human()):
                             p = self.board.piece_at(sq)
                             if p and p.color == self.board.turn:
@@ -1774,9 +2483,28 @@ class ChessGame:
                         # click without drag already selected; keep selection
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
-                        self.selected = None
-                        self.legal_for_selected = []
-                        self.promotion_choices = []
+                        if self.screen_state in ("tiers", "profile"):
+                            self.screen_state = "home"
+                        elif self.selected is not None or self.promotion_choices:
+                            self.selected = None
+                            self.legal_for_selected = []
+                            self.promotion_choices = []
+                        elif self.screen_state in ("play", "puzzle"):
+                            self.screen_state = "home"
+                    elif event.key == pygame.K_1 and self.screen_state == "home":
+                        self._go_home_tile("play")
+                    elif event.key == pygame.K_2 and self.screen_state == "home":
+                        self._go_home_tile("puzzles")
+                    elif event.key == pygame.K_3 and self.screen_state == "home":
+                        self._go_home_tile("profile")
+                    elif event.key == pygame.K_4 and self.screen_state == "home":
+                        self._go_home_tile("study")
+                    elif event.key == pygame.K_1 and self.screen_state == "tiers":
+                        self.enter_tier("easy")
+                    elif event.key == pygame.K_2 and self.screen_state == "tiers":
+                        self.enter_tier("medium")
+                    elif event.key == pygame.K_3 and self.screen_state == "tiers":
+                        self.enter_tier("hard")
                     elif event.key == pygame.K_n:
                         if self.puzzle_mode:
                             if self.puzzle_status in ("solved", "failed"):
@@ -1802,12 +2530,15 @@ class ChessGame:
                     elif event.key == pygame.K_h:
                         self.show_hint()
                     elif event.key == pygame.K_p:
-                        if self.spar_mode:
+                        if self.screen_state == "home":
+                            self.screen_state = "tiers"
+                        elif self.spar_mode:
                             self.exit_spar()
-                        if self.puzzle_mode:
+                            self.screen_state = "tiers"
+                        elif self.puzzle_mode:
                             self.exit_puzzle()
                         else:
-                            self.enter_puzzle()
+                            self.screen_state = "tiers"
                         self.sound.move()
                     elif event.key == pygame.K_s:
                         if self.spar_mode:
@@ -1823,11 +2554,35 @@ class ChessGame:
                         self.fetch_daily_puzzle()
                         self.sound.move()
 
+            if self.screen_state == "study":
+                self.study_screen.update()
+                self.draw()
+                continue
+
             # AI
             self.maybe_start_ai()
             self.poll_ai()
             # puzzle opponent auto-reply
             self.fire_pending_reply()
+            # puzzle clock → timeout fail
+            if (self.puzzle_mode and self.puzzle_status == "solving"
+                    and self.puzzle_deadline
+                    and time.time() > self.puzzle_deadline):
+                self._puzzle_timeout()
+            # deferred solve/fail finalization (needs the grade for bonus/verdict)
+            if self._solve_pending and (self._pending_meta is None
+                                        or time.time() - self._solve_at > 1.5):
+                self._finalize_puzzle_solve()
+            if (self.puzzle_mode and self.puzzle_status == "failed_pending"
+                    and not self.grading_busy
+                    and time.time() - self._fail_at > 1.2 and self._fail_uci):
+                try:
+                    self._puzzle_failed(self._fail_uci, self._reconstruct_before(
+                        chess.Move.from_uci(self._fail_uci)))
+                except Exception:
+                    pass
+            # rated game → Elo once the game ends
+            self._maybe_rate_game()
 
             # advance animations
             finished: list[MoveAnim] = []
@@ -1847,7 +2602,18 @@ class ChessGame:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Chesso chess game and local research study")
+    parser.add_argument("--study", action="store_true", help="open the study screen")
+    parser.add_argument("--participant", help="pseudonymous study code")
+    parser.add_argument("--condition", choices=("informational", "reflective"))
+    parser.add_argument("--protocol", help="path to a frozen study protocol")
+    parser.add_argument("--collection", choices=("pilot", "main"), default="pilot")
+    parser.add_argument("--resume", help="resume a local study session folder")
+    args = parser.parse_args()
     game = ChessGame()
+    game.study_options = {key: value for key, value in vars(args).items() if value is not None}
+    if args.study or args.resume:
+        game._go_home_tile("study")
     game.run()
 
 
