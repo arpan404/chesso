@@ -15,5 +15,8 @@ rating.json
 profile.json
 data/
 
-# Individual coursework documents
-docs/reading-logs/
+# Local documentation
+/docs/
+/README.md
+/DATASET.md
+/THIRD_PARTY_NOTICES.md
