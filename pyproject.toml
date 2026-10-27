@@ -1,9 +1,15 @@
 [project]
 name = "chesso"
 version = "0.1.0"
-description = "Desktop chess and a local study of hint-assisted learning"
+description = "Chess training and hint studies with React and FastAPI"
 requires-python = ">=3.13"
 dependencies = [
     "chess>=1.11.2",
-    "pygame>=2.6.1",
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34,<1",
+    "pyjwt[crypto]>=2.10,<3",
+    "psycopg[binary,pool]>=3.2,<4",
 ]
+
+[dependency-groups]
+dev = ["httpx>=0.28,<1"]

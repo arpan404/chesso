@@ -18,5 +18,18 @@ data/
 # Local documentation
 /docs/
 /README.md
-/DATASET.md
-/THIRD_PARTY_NOTICES.md
+
+# Web dependencies, build output, and deployment secrets
+node_modules/
+frontend/dist/
+.env
+.env.*
+!.env.example
+*.sqlite3*
+
+*.tsbuildinfo
+
+# Browser test output
+frontend/test-results/
+frontend/playwright-report/
+.neon

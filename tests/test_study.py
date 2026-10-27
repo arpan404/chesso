@@ -7,10 +7,17 @@ from pathlib import Path
 
 import chess
 
-from import_puzzletrack import import_protocol
-from study import (StudySession, digest, export_session, load_protocol, read_events,
-                   trial_rows, validate_protocol)
-from study_analysis import summarize
+from backend.tools.import_puzzletrack import import_protocol
+from backend.study import (
+    StudySession,
+    digest,
+    export_session,
+    load_protocol,
+    read_events,
+    trial_rows,
+    validate_protocol,
+)
+from backend.tools.study_analysis import summarize
 
 
 class Clock:
@@ -28,12 +35,20 @@ class StudyTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.protocol = load_protocol()
         self.clock = Clock()
-        self.session = StudySession.create(self.protocol, "SYNTHETIC", "reflective",
-                                           directory=self.root / "session", seed=12)
+        self.session = StudySession.create(
+            self.protocol,
+            "SYNTHETIC",
+            "reflective",
+            directory=self.root / "session",
+            seed=12,
+        )
 
     def trial(self, phase="baseline"):
-        self.session.index = next(i for i, a in enumerate(self.session.manifest["assignments"])
-                                  if a["phase"] == phase)
+        self.session.index = next(
+            i
+            for i, a in enumerate(self.session.manifest["assignments"])
+            if a["phase"] == phase
+        )
         trial = self.session.prepare(self.clock)
         trial.present()
         return trial
@@ -50,7 +65,11 @@ class StudyTests(unittest.TestCase):
         trial.submit(moves[1], 50)
         self.assertEqual(fen, trial.board.fen())
         self.assertEqual([], trial.board.move_stack)
-        row = next(r for r in trial_rows(self.session.directory) if r["phase"] == "training" and r["status"] == "submitted")
+        row = next(
+            r
+            for r in trial_rows(self.session.directory)
+            if r["phase"] == "training" and r["status"] == "submitted"
+        )
         self.assertTrue(row["revised"])
         self.assertTrue(row["reflection_saved"])
         self.assertEqual(row["initial_confidence"], 25)
@@ -83,10 +102,16 @@ class StudyTests(unittest.TestCase):
         move = next(iter(trial.board.legal_moves)).uci()
         trial.record_initial(move, 50)
         reflective = trial.request_hint()
-        other = StudySession.create(self.protocol, "OTHER", "informational",
-                                    directory=self.root / "other", seed=12)
+        other = StudySession.create(
+            self.protocol,
+            "OTHER",
+            "informational",
+            directory=self.root / "other",
+            seed=12,
+        )
         other.index = self.session.index
-        info = other.prepare(self.clock); info.present()
+        info = other.prepare(self.clock)
+        info.present()
         info.record_initial(move, 50)
         self.assertEqual(reflective, info.request_hint())
         info.submit(move, 50)
@@ -105,7 +130,9 @@ class StudyTests(unittest.TestCase):
         self.assertIsNone(row["final_confidence"])
         self.assertEqual(row["final_ms"], 90000)
         self.assertEqual(row["post_initial_ms"], 90000)
-        self.assertEqual(read_events(self.session.log.path)[-1]["observed_end_ms"], 98000)
+        self.assertEqual(
+            read_events(self.session.log.path)[-1]["observed_end_ms"], 98000
+        )
 
     def test_abort_after_deadline_is_timeout(self):
         trial = self.trial()
@@ -133,7 +160,13 @@ class StudyTests(unittest.TestCase):
         trial.submit(move, 50)
         with self.assertRaises(ValueError):
             trial.submit(move, 50)
-        self.assertEqual(sum(e["kind"] == "trial_finished" for e in read_events(self.session.log.path)), 1)
+        self.assertEqual(
+            sum(
+                e["kind"] == "trial_finished"
+                for e in read_events(self.session.log.path)
+            ),
+            1,
+        )
 
     def test_resume_marks_unfinished_trial_interrupted_without_inventing_time(self):
         trial = self.trial()
@@ -151,7 +184,8 @@ class StudyTests(unittest.TestCase):
     def test_resume_completed_trial_does_not_repeat_it(self):
         trial = self.trial()
         move = next(iter(trial.board.legal_moves)).uci()
-        trial.record_initial(move, 25); trial.submit(move, 50)
+        trial.record_initial(move, 25)
+        trial.submit(move, 50)
         self.session.close()
         resumed = StudySession.resume(self.session.directory)
         self.assertEqual(resumed.index, 1)
@@ -171,12 +205,19 @@ class StudyTests(unittest.TestCase):
     def test_forms_switch_without_repeating_positions(self):
         orders = set()
         for seed in range(12):
-            session = StudySession.create(self.protocol, f"TEST_{seed}",
-                                          directory=self.root / f"form_{seed}", seed=seed)
+            session = StudySession.create(
+                self.protocol,
+                f"TEST_{seed}",
+                directory=self.root / f"form_{seed}",
+                seed=seed,
+            )
             orders.add(session.manifest["form_order"])
             assigned = session.manifest["assignments"]
             self.assertEqual(len({a["item_id"] for a in assigned}), 16)
-            self.assertEqual([a["phase"] for a in assigned], ["baseline"]*4+["training"]*8+["transfer"]*4)
+            self.assertEqual(
+                [a["phase"] for a in assigned],
+                ["baseline"] * 4 + ["training"] * 8 + ["transfer"] * 4,
+            )
         self.assertEqual(orders, {"AB", "BA"})
 
     def test_main_collection_rejects_draft_hints_and_missing_benchmarks(self):
@@ -185,8 +226,13 @@ class StudyTests(unittest.TestCase):
         protocol = copy.deepcopy(self.protocol)
         protocol["status"] = "frozen"
         for item in protocol["items"]:
-            item["benchmark"] = dict(accepted_moves=[item["reference_move"]], objective="test fixture only",
-                                      method="synthetic", reviewer="TEST", settings="TEST")
+            item["benchmark"] = dict(
+                accepted_moves=[item["reference_move"]],
+                objective="test fixture only",
+                method="synthetic",
+                reviewer="TEST",
+                settings="TEST",
+            )
             if item["set"] == "training":
                 item["hint"].update(review_status="approved", reviewer="TEST")
         protocol["task_prompt"] = "Test fixture only."
@@ -206,8 +252,11 @@ class StudyTests(unittest.TestCase):
     def test_export_keeps_missing_assignments_and_self_reports(self):
         trial = self.trial()
         move = next(iter(trial.board.legal_moves)).uci()
-        trial.familiarity("yes"); trial.focus(False)
-        trial.record_initial(move, 75); trial.submit(move, 100); trial.reason("guess")
+        trial.familiarity("yes")
+        trial.focus(False)
+        trial.record_initial(move, 75)
+        trial.submit(move, 100)
+        trial.reason("guess")
         output = export_session(self.session.directory, self.root / "export.csv")
         with output.open() as stream:
             rows = list(csv.DictReader(stream))
@@ -223,8 +272,13 @@ class StudyTests(unittest.TestCase):
     def test_pilot_reference_agreement_is_not_benchmark_accuracy(self):
         trial = self.trial()
         move = trial.item["reference_move"]
-        trial.record_initial(move, 100); trial.submit(move, 100)
-        summary = next(r for r in summarize(trial_rows(self.session.directory)) if r["phase"] == "baseline")
+        trial.record_initial(move, 100)
+        trial.submit(move, 100)
+        summary = next(
+            r
+            for r in summarize(trial_rows(self.session.directory))
+            if r["phase"] == "baseline"
+        )
         self.assertEqual(summary["reference_agreement"], 1)
         self.assertEqual(summary["benchmark_scored"], 0)
         self.assertIsNone(summary["benchmark_success_rate"])
@@ -235,20 +289,32 @@ class StudyTests(unittest.TestCase):
         item = next(i for i in self.protocol["items"] if i["id"] == item_id)
         moves = [m.uci() for m in chess.Board(item["fen"]).legal_moves]
         alternative = next(m for m in moves if m != item["reference_move"])
-        item["benchmark"] = dict(accepted_moves=[alternative], objective="synthetic test")
-        self.session = StudySession.create(self.protocol, "SCORING_TEST", "reflective",
-                                           directory=self.root / "scoring", seed=12)
+        item["benchmark"] = dict(
+            accepted_moves=[alternative], objective="synthetic test"
+        )
+        self.session = StudySession.create(
+            self.protocol,
+            "SCORING_TEST",
+            "reflective",
+            directory=self.root / "scoring",
+            seed=12,
+        )
         trial = self.trial()
-        trial.record_initial(alternative, 50); trial.submit(alternative, 75)
-        summary = next(r for r in summarize(trial_rows(self.session.directory)) if r["phase"] == "baseline")
+        trial.record_initial(alternative, 50)
+        trial.submit(alternative, 75)
+        summary = next(
+            r
+            for r in summarize(trial_rows(self.session.directory))
+            if r["phase"] == "baseline"
+        )
         self.assertEqual(summary["reference_agreement"], 0)
         self.assertEqual(summary["benchmark_success_rate"], 1)
-        self.assertAlmostEqual(summary["confidence_brier"], .0625)
+        self.assertAlmostEqual(summary["confidence_brier"], 0.0625)
 
     def test_foreign_events_are_not_silently_combined(self):
         event = read_events(self.session.log.path)[0]
         event["participant"] = "SOMEONE_ELSE"
-        self.session.log.path.write_text(json.dumps(event)+"\n")
+        self.session.log.path.write_text(json.dumps(event) + "\n")
         with self.assertRaisesRegex(ValueError, "different session"):
             trial_rows(self.session.directory)
 
@@ -262,22 +328,34 @@ class StudyTests(unittest.TestCase):
     def test_pilot_rerun_records_actual_prior_exposure(self):
         trial = self.trial()
         trial.finish("aborted")
-        second = StudySession.create(self.protocol, "SYNTHETIC", "reflective",
-                                      directory=self.root / "rerun", seed=12)
+        second = StudySession.create(
+            self.protocol,
+            "SYNTHETIC",
+            "reflective",
+            directory=self.root / "rerun",
+            seed=12,
+        )
         rows = trial_rows(second.directory)
         self.assertTrue(rows[0]["prior_exposure"])
         self.assertEqual(sum(r["prior_exposure"] for r in rows), 1)
 
     def test_importer_applies_setup_and_preserves_source_fields(self):
         rows = [i["source_row"] for i in self.protocol["items"]]
-        source = dict(format="puzzletrack-local-pool", version=1,
-                      source=self.protocol["source_bank"]["provenance"], puzzles=rows)
-        path = self.root / "pool.json"; path.write_text(json.dumps(source))
+        source = dict(
+            format="puzzletrack-local-pool",
+            version=1,
+            source=self.protocol["source_bank"]["provenance"],
+            puzzles=rows,
+        )
+        path = self.root / "pool.json"
+        path.write_text(json.dumps(source))
         imported = import_protocol(path)
         original = {i["id"]: i for i in self.protocol["items"]}
         for item in imported["items"]:
             self.assertEqual(item["fen"], original[item["id"]]["fen"])
-            self.assertEqual(item["reference_move"], item["source_row"]["Moves"].split()[1])
+            self.assertEqual(
+                item["reference_move"], item["source_row"]["Moves"].split()[1]
+            )
             self.assertEqual(item["source_license"], "CC0-1.0")
         source["puzzles"][0]["Moves"] += " a1a1"
         path.write_text(json.dumps(source))
@@ -286,6 +364,7 @@ class StudyTests(unittest.TestCase):
 
     def test_writing_failure_does_not_claim_the_choice_was_saved(self):
         from unittest.mock import patch
+
         trial = self.trial()
         move = next(iter(trial.board.legal_moves)).uci()
         with patch.object(trial.log, "append", side_effect=OSError("disk full")):

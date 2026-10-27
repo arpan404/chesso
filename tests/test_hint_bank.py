@@ -1,21 +1,32 @@
 import copy
 import unittest
 
-from hint_bank import attach_outputs, generation_requests
-from study import load_protocol
+from backend.tools.hint_bank import attach_outputs, generation_requests
+from backend.study import load_protocol
 
 
 class HintBankTests(unittest.TestCase):
     def setUp(self):
         self.protocol = load_protocol()
         self.requests = generation_requests(self.protocol)
-        self.outputs = dict(format="chesso-hint-outputs-v1", protocol_hash=self.requests["protocol_hash"],
-                            hints=[dict(item_id=r["item_id"], position_hash=r["position_hash"],
-                                        text="Synthetic hint for this test only.",
-                                        reflection_prompt="Synthetic question for this test only?",
-                                        generation=dict(model="SYNTHETIC_TEST_MODEL", prompt=r["prompt"],
-                                                        generated_at="2026-10-06T00:00:00+00:00"))
-                                   for r in self.requests["requests"]])
+        self.outputs = dict(
+            format="chesso-hint-outputs-v1",
+            protocol_hash=self.requests["protocol_hash"],
+            hints=[
+                dict(
+                    item_id=r["item_id"],
+                    position_hash=r["position_hash"],
+                    text="Synthetic hint for this test only.",
+                    reflection_prompt="Synthetic question for this test only?",
+                    generation=dict(
+                        model="SYNTHETIC_TEST_MODEL",
+                        prompt=r["prompt"],
+                        generated_at="2026-10-06T00:00:00+00:00",
+                    ),
+                )
+                for r in self.requests["requests"]
+            ],
+        )
 
     def test_only_training_is_sent_for_generation(self):
         ids = {r["item_id"] for r in self.requests["requests"]}
@@ -30,11 +41,16 @@ class HintBankTests(unittest.TestCase):
         for item in attached["items"]:
             if item["set"] == "training":
                 self.assertEqual(item["hint"]["review_status"], "draft")
-                self.assertEqual(item["hint"]["generation"]["model"], "SYNTHETIC_TEST_MODEL")
+                self.assertEqual(
+                    item["hint"]["generation"]["model"], "SYNTHETIC_TEST_MODEL"
+                )
         self.assertEqual(self.protocol["hint_source"], "human_template")
 
     def test_stale_position_or_prompt_is_rejected(self):
-        for field, bad in (("position_hash", "other_position"), ("protocol_hash", "old_protocol")):
+        for field, bad in (
+            ("position_hash", "other_position"),
+            ("protocol_hash", "old_protocol"),
+        ):
             output = copy.deepcopy(self.outputs)
             if field == "protocol_hash":
                 output[field] = bad
