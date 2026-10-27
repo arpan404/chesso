@@ -17,6 +17,11 @@ export function AppFooter() {
     <footer className="app-footer">
       <span className="footer-brand">Chesso</span>
       <ResearchCredits />
+      <nav aria-label="Legal" className="research-credits">
+        <a href="/privacy">Privacy</a>
+        {" · "}
+        <a href="/terms">Terms</a>
+      </nav>
     </footer>
   );
 }
